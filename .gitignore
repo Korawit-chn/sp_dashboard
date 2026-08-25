@@ -1,0 +1,18 @@
+# Secrets - never commit. See dashboard/backend/.env.example for the shape.
+.env
+*.env
+!*.env.example
+
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
