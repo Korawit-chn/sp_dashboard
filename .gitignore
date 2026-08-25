@@ -16,3 +16,6 @@ venv/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Working notes for the AI assistant - scratch, not part of the project.
+AI Assistant/
