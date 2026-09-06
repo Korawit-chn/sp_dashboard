@@ -1,4 +1,4 @@
-const API = window.CONFIG.API
+// API, api(), getSelectedSensors() and sensorNameOf() come from common.js.
 
 let echart = null     // ECharts
 let allData = []
@@ -14,7 +14,7 @@ let endTime = null
 // Load data
 // =====================
 async function loadData() {
-  let url = `${API}/logs`
+  let url = `/logs`
 
   if (timeMode === "hours") {
     url += `?hours=6`
@@ -24,10 +24,15 @@ async function loadData() {
     url += `?start=${startTime}`
   }
 
-  const res = await fetch(url)
+  let rows
+  try {
+    rows = await api(url)
+  } catch (err) {
+    console.error("logs unavailable:", err.message)
+    return
+  }
 
-
-  allData = await res.json()
+  allData = rows.map(d => ({ ...d, sensorName: sensorNameOf(d) }))
 
   // keep only rows with wind
   allData = allData.filter(d => d.windspeed !== null)
@@ -101,7 +106,7 @@ function setupToggle() {
 // Sensor checkboxes
 // =====================
 function createCheckboxes() {
-  const sensors = [...new Set(allData.map(d => d.sensorType))]
+  const sensors = [...new Set(allData.map(d => d.sensorName))]
   const container = document.getElementById("checkboxes")
 
   container.innerHTML = ""
@@ -181,7 +186,7 @@ function buildRoseChart() {
   // =====================
   const selectedSensors = getSelectedSensors()
   const filteredData = allData.filter(d =>
-    selectedSensors.includes(d.sensorType)
+    selectedSensors.includes(d.sensorName)
   )
 
   // =====================
@@ -262,13 +267,6 @@ function buildRoseChart() {
 }
 
 
-
-
-// =====================
-function getSelectedSensors() {
-  return [...document.querySelectorAll("#checkboxes input:checked")]
-    .map(c => c.value)
-}
 
 
 // =====================

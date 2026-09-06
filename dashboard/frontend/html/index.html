@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
   <a href="index.html">Temp/Humidity/VPD</a> |
-  <a href="wind3.html">Wind</a>
+<a href="wind3.html">Wind</a>
 <hr>
 
 <head>
@@ -9,24 +9,73 @@
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+  <link rel="stylesheet" href="../style.css">
 </head>
 
 <body>
   <h2>Sensor Dashboard</h2>
 
-  <div id="metrics">
-    <label><input type="checkbox" value="temperature" checked> Temperature</label>
-    <label><input type="checkbox" value="humidity" checked> Humidity</label>
-    <label><input type="checkbox" value="VPD" checked> VPD</label>
+  <h3>Sampling interval</h3>
+  <div class="panel">
+    <label>
+      <span id="periodLabel">Period (seconds):</span>
+      <!-- min/max are set from GET /api/config at load; these are only a
+           sensible starting point if that call fails. -->
+      <input type="number" id="periodInput" min="2" max="3600" step="1" size="5">
+    </label>
+    <!-- Two different things. Period is how often a sensor READS, and every Pi
+         switches it on the same instant. Upload is how often a Pi SENDS what it
+         has read; readings are cached locally in between, so a long upload
+         interval loses nothing and does not make a Pi look offline - the
+         heartbeat is separate and stays at 60 s. -->
+    <label>
+      <span id="sendLabel">Upload every (seconds):</span>
+      <input type="number" id="sendInput" min="5" max="3600" step="1" size="5">
+    </label>
+    <button id="applyPeriod">Apply to all sensors</button>
+    <span id="scheduleStatus" class="muted">loading...</span>
+    <div id="clockSkew" class="muted"></div>
   </div>
-  <br>
 
+  <h3>Mist makers</h3>
+  <div id="mistNote" class="muted"></div>
+  <div id="mistPanels"></div>
+
+  <h3>Fans</h3>
+  <div id="fanNote" class="muted"></div>
+  <div id="fanPanels"></div>
+
+  <h3>Devices</h3>
+  <div id="deviceNote" class="muted"></div>
+  <table id="deviceTable">
+    <thead>
+      <tr>
+        <th>ID</th><th>Device</th><th>State</th><th>Last seen</th><th>Booted at</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <h3>Sensors</h3>
   <div id="checkboxes"></div>
-  <br>
 
-  <canvas id="chart" height="100"></canvas>
+  <h3>Temperature</h3>
+  <canvas id="tempChart" height="100"></canvas>
 
+  <h3>Humidity</h3>
+  <canvas id="humiChart" height="100"></canvas>
+
+  <h3>VPD</h3>
+  <canvas id="VPDChart" height="100"></canvas>
+
+  <!-- config.js then common.js first: common.js reads window.CONFIG and defines
+       API, api(), formatAge(), toNumber() and getSelectedSensors(). The three
+       panel scripts below are independent of each other and may be reordered. -->
   <script src="../js/config.js"></script>
+  <script src="../js/common.js"></script>
+  <script src="../js/devices.js"></script>
+  <script src="../js/actuators.js"></script>
   <script src="../js/script.js"></script>
 </body>
 </html>
+

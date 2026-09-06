@@ -1,8 +1,5 @@
 # Link
-https://github.com/Korawit-chn/sp_piSensor
-
-https://github.com/Korawit-chn/sp_piActuator
-
+https://github.com/Omelettae/dht22
 
 # Version
 | Server | Sensor | Database |

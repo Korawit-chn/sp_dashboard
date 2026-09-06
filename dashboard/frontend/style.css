@@ -6,3 +6,29 @@ body {
 canvas {
   max-width: 700px;
 }
+
+.panel {
+  margin-bottom: 10px;
+}
+
+.muted {
+  color: #666;
+  font-size: 0.9em;
+}
+
+table {
+  border-collapse: collapse;
+  margin-bottom: 20px;
+  max-width: 700px;
+}
+
+th, td {
+  border: 1px solid #ccc;
+  padding: 4px 8px;
+  text-align: left;
+  font-size: 0.9em;
+}
+
+th {
+  background: #f2f2f2;
+}
