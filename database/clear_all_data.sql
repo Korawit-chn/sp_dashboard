@@ -4,13 +4,14 @@
 --     mysql -u seniordashboard -p <your_database> < database/clear_all_data.sql
 --
 -- This is the full reset. Tables, columns, indexes and foreign keys all
--- survive; every row goes. To rebuild the schema as well, drop the database
--- yourself and re-run database/Database_v3.6.sql - the archived Database_v3af.sql
--- is no longer an install path (see database/archive/README.md).
+-- survive; every row goes. To rebuild the SCHEMA as well, run
+-- database/Database_v3.6.sql instead - it drops and recreates
+-- sensor_dashboard_v3_6 from scratch. Nothing in database/archive/ is an
+-- install path except the upgrade file (see database/archive/README.md).
 --
 -- SchemaVersion IS DELIBERATELY NOT EMPTIED. It records which migrations have
 -- run; clearing it would make every migration look unapplied, and the next
--- Database_v3.6.sql run would report a database it cannot account for. It holds
+-- upgrade run would report a database it cannot account for. It holds
 -- bookkeeping, not application data. Do not add it to the DELETE list below.
 --
 -- BACK UP FIRST if anything might matter:

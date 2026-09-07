@@ -1,170 +1,88 @@
 -- ============================================================================
--- sensor_dashboard v3.6 - complete schema AND full migration history
+-- sensor_dashboard v3.6 - fresh install
 --
--- ONE FILE, ONE RUN. Build a database from nothing, or bring any v3-family
--- database up to v3.6. Same file, same command, either way. Run it twice and
--- the second run changes nothing.
+-- A BRAND NEW DATABASE. This file builds `sensor_dashboard_v3_6` from nothing,
+-- in one command:
 --
---   FRESH INSTALL
---     mysql -u root -p -e "CREATE DATABASE sensor_dashboard_v3af"
---     mysql -u root -p sensor_dashboard_v3af < database/Database_v3.6.sql
---
---   UPGRADE AN EXISTING DATABASE (this is the live one - it already holds data)
---     mysql -u root -p sensor_dashboard_v3af < database/Database_v3.6.sql
+--     mysql -u root -p < database/Database_v3.6.sql
 --
 -- ----------------------------------------------------------------------------
--- READ THIS BEFORE RUNNING IT ON A DATABASE THAT HOLDS DATA
+-- IT DROPS THE DATABASE FIRST
 --
--- v3.5 promised "nothing here is destructive, point it at the live database
--- freely". v3.6 CANNOT make that promise. M005 in Section 3 DROPS the
--- ActuatorStatus table and three columns:
+-- The first statement is DROP DATABASE IF EXISTS sensor_dashboard_v3_6. Point
+-- it at a database that holds readings and every one of them is gone, with no
+-- prompt and no way back. This file is for building a new database, not for
+-- upgrading one that already exists.
 --
---     ActuatorStatus             the whole table - liveness moved to
---                                DeviceStatus, reported by the device agent
---     Actuator.deviceUUID        replaced by a real deviceID foreign key
---     DeviceStatus.batteryLevel  never had a writer
---     DeviceStatus.signalStrength           "
+-- To UPGRADE an existing v3-family database in place - your live
+-- `sensor_dashboard_v3af` is one - use the other file:
 --
--- M005 also CREATES rows: a Device for any actuator whose Pi never registered
--- one, reconstructed from the UUID already stored on the Actuator.
+--     mysql -u root -p sensor_dashboard_v3af < database/archive/Database_v3.6_upgrade.sql
 --
--- Nothing of value is lost - M005 in Section 3 gives the row-by-row reasoning -
--- but it is a one-way change, so:
+-- That one is idempotent, takes its database name from the command line, and
+-- carries the full M001-M006 migration history. It is the only path that
+-- preserves data. Back up before either:
 --
---     mysqldump -u root -p <your_database> > full_backup.sql
---
--- AND STOP THE PIs FIRST. On the old code the mist client writes to
--- ActuatorStatus every 60 s, and a write landing mid-migration is an error in
--- its journal.
---
---     sudo systemctl stop mist fan "sensor@*"
+--     mysqldump -u root -p sensor_dashboard_v3af > full_backup.sql
 -- ----------------------------------------------------------------------------
 --
--- The database name is NOT written into this file. It comes from the command
--- line, and every check below uses DATABASE(), so the same file works against
--- any name you choose. Run it with no database selected and MySQL stops with
--- "No database selected" rather than doing something surprising.
+-- The M-numbers in the comments below (M004, M005, M006) name migrations in
+-- the history that produced this shape. Nothing here replays them - a new
+-- database is created at v3.6 directly - but the reasoning is worth keeping
+-- next to the columns it explains. The migrations themselves live in
+-- database/archive/Database_v3.6_upgrade.sql.
 --
--- There is still NO "DROP DATABASE" here, unlike Database_v3af.sql - the drops
--- M005 performs are surgical and named above. To rebuild from scratch, drop it
--- yourself first, deliberately:
---     mysql -u root -p -e "DROP DATABASE sensor_dashboard_v3af"
+-- AFTER RUNNING IT. The backend connects as `seniordashboard`, which has only
+-- SELECT/INSERT/UPDATE/DELETE and is not created here. Grant it access, or the
+-- backend cannot connect:
 --
--- Needs ALTER, INDEX and CREATE rights, so run it as root. The app user
--- (seniordashboard) has only SELECT/INSERT/UPDATE/DELETE. After a fresh
--- install, grant it access or the backend cannot connect:
 --     GRANT SELECT, INSERT, UPDATE, DELETE
---       ON sensor_dashboard_v3af.* TO 'seniordashboard'@'%';
+--       ON sensor_dashboard_v3_6.* TO 'seniordashboard'@'%';
 --     FLUSH PRIVILEGES;
 --
+-- Then point the backend at it in dashboard/backend/.env:
+--
+--     DB_NAME=sensor_dashboard_v3_6
+--
+-- and restart the backend, then every Pi - both clients cache their sensorID /
+-- actuatorID in memory and only re-register on start.
+--
 -- HOW IT IS PUT TOGETHER
---   Section 0  safety guards - stop early on a database this cannot upgrade
---   Section 1  the schema, every table, CREATE TABLE IF NOT EXISTS
---   Section 2  seed data, inserted only if absent
---   Section 3  migration history, every migration, each one idempotent
---   Section 4  optional performance work, commented out on purpose
---   Section 5  report - prints what you ended up with
+--   Section 1  the schema, every table, in dependency order
+--   Section 2  seed data - one SamplingConfig row, and the version stamp
+--   Section 3  optional performance work, commented out on purpose
+--   Section 4  report - prints what you ended up with
 --
--- Section 1 handles a MISSING TABLE. Section 3 handles a table that exists in
--- an older shape and is missing COLUMNS or INDEXES - or, in M005, one that is
--- the wrong shape entirely. Together they cover every v3-family database.
--- Which migrations actually did something is recorded in the SchemaVersion
--- table, so a second run tells you where you stand.
---
--- WHAT CHANGED FROM v3.5: M005, which v3.5 refused to run - it stopped against
--- a pre-M005 database and told you to run database/M005_device_liveness.sql
--- yourself first. That separate file is folded in here and archived. And M006,
--- one additive column carrying the upload interval.
---
--- NO SEED DATA beyond one SamplingConfig default. Devices, sensors, actuators,
--- types and locations are created by their register endpoints on first contact
--- (POST /api/registerSensor, POST /api/registerActuator). Seeding them here
--- would be a second source of truth that goes stale the moment someone adds
--- hardware the normal way.
+-- NO SEED DATA beyond the one SamplingConfig default. Devices, sensors,
+-- actuators, types and locations are created by their register endpoints on
+-- first contact (POST /api/registerSensor, POST /api/registerActuator).
+-- Seeding them here would be a second source of truth that goes stale the
+-- moment someone adds hardware the normal way. A database built by this file
+-- is empty and stays empty until a Pi talks to it.
 -- ============================================================================
 
-
--- ============================================================================
--- SECTION 0 - GUARDS
---
--- Two database shapes exist that this file CANNOT upgrade in place. Both are
--- caught here, before anything is written, because the alternative is worse:
--- CREATE TABLE IF NOT EXISTS silently accepts a table of the wrong shape, and
--- you would end up with a half-migrated database that appears to have worked.
---
--- A guard aborts by selecting from a table that does not exist. The error
--- message names it, and the name is the explanation. Nothing has been changed
--- at that point.
--- ============================================================================
-
--- ----------------------------------------------------------------------------
--- Guard 1: a v2 database (`sensor_dashboard`, and `dashboard/database.sql`)
---
--- In v2 a sensor carried its own deviceUUID and there was no Device table at
--- all. v3 introduced Device because a power cut takes out a whole Pi, not one
--- sensor, so DeviceStatus / DeviceEvent / DeviceSession all had to be re-keyed
--- from sensorID to deviceID.
---
--- That is a data migration, not a column addition: every Sensor row has to be
--- matched to a Device row that does not exist yet. It is deliberately not
--- attempted here. See "The v2 lineage" at the bottom of Section 3.
--- ----------------------------------------------------------------------------
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.TABLES
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Sensor')
-  AND NOT EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Sensor'
-           AND COLUMN_NAME = 'deviceID'),
-  'SELECT * FROM `STOP_v2_database_Sensor_has_no_deviceID_see_section_0_guard_1`',
-  'SELECT 1');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- ----------------------------------------------------------------------------
--- Guard 2: a pre-v3af database (`database/Database_v3.sql`)
---
--- There, Actuator carried `actuatorType VARCHAR(50)` inline. v3af replaced it
--- with a typeID foreign key into a new ActuatorType table, which means reading
--- every distinct actuatorType, creating a row per type, and rewriting each
--- Actuator to point at it - again a data migration, and one that was never
--- needed because v3 was never deployed. The live server went straight to v3af.
--- ----------------------------------------------------------------------------
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-           AND COLUMN_NAME = 'actuatorType'),
-  'SELECT * FROM `STOP_v3_database_Actuator_has_actuatorType_see_guard_2`',
-  'SELECT 1');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- There is no Guard 3. An actuator whose Pi has no Device row - the normal
--- state of a mist Pi before this upgrade, because the old registerActuator
--- never created one - is HANDLED, not refused. See M005 step 1.
---
--- Refusing would have deadlocked: the new backend creates that Device row, but
--- it cannot talk to the old schema, and the old backend never creates it. The
--- UUID is already on the Actuator row, so the migration reconstructs the Device
--- from it instead.
+DROP DATABASE IF EXISTS sensor_dashboard_v3_6;
+CREATE DATABASE sensor_dashboard_v3_6;
+USE sensor_dashboard_v3_6;
 
 
 -- ============================================================================
 -- SECTION 1 - SCHEMA
 --
 -- Every table, in dependency order (a foreign key needs its parent to exist).
--- IF NOT EXISTS throughout, so this section is a no-op on a database that
--- already has them and creates the missing ones on a database that does not.
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
 -- Bookkeeping. Not application data - the backend never reads this. It records
--- which migrations in Section 3 have run, so re-running this file tells you
--- what state the database is in instead of just succeeding silently.
+-- which migrations the database has had applied. A database built by this file
+-- starts life at v3.6, so Section 2 stamps M001-M006 as already applied: they
+-- describe how an older database reaches this shape, and none of them has any
+-- work to do on one created here.
 --
 -- clear_all_data.sql must NOT empty this table: losing it would make every
 -- migration look unapplied.
 -- ----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS SchemaVersion (
+CREATE TABLE SchemaVersion (
     migrationID VARCHAR(16) PRIMARY KEY,
     description VARCHAR(255) NOT NULL,
     appliedAt   TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
@@ -175,7 +93,7 @@ CREATE TABLE IF NOT EXISTS SchemaVersion (
 -- Identity: where things are, what they are, which box they run on
 -- ----------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS Location (
+CREATE TABLE Location (
     locationID INT AUTO_INCREMENT PRIMARY KEY,
     locationName VARCHAR(100) NOT NULL,
     latitude DECIMAL(9,6),
@@ -184,7 +102,7 @@ CREATE TABLE IF NOT EXISTS Location (
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS SensorType (
+CREATE TABLE SensorType (
     typeID INT AUTO_INCREMENT PRIMARY KEY,
     sensorType VARCHAR(50)
 );
@@ -192,7 +110,7 @@ CREATE TABLE IF NOT EXISTS SensorType (
 -- A Pi, not a sensor. One device owns several Sensor rows, and a power cut
 -- takes out the whole box - which is why status, events and sessions all key
 -- on deviceID rather than sensorID.
-CREATE TABLE IF NOT EXISTS Device (
+CREATE TABLE Device (
     deviceID INT AUTO_INCREMENT PRIMARY KEY,
 
     deviceUUID CHAR(36) NOT NULL UNIQUE,
@@ -203,7 +121,7 @@ CREATE TABLE IF NOT EXISTS Device (
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS Sensor (
+CREATE TABLE Sensor (
     sensorID INT AUTO_INCREMENT PRIMARY KEY,
 
     deviceID INT NOT NULL,
@@ -237,7 +155,7 @@ CREATE TABLE IF NOT EXISTS Sensor (
         )
 );
 
-CREATE TABLE IF NOT EXISTS SensorOffset (
+CREATE TABLE SensorOffset (
     offsetID        INT AUTO_INCREMENT PRIMARY KEY,
     sensorID        INT NOT NULL,
     tempOffset      DECIMAL(5,2) DEFAULT 0.00,
@@ -256,7 +174,7 @@ CREATE TABLE IF NOT EXISTS SensorOffset (
 -- Readings
 -- ----------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS SensorLog (
+CREATE TABLE SensorLog (
     logID BIGINT AUTO_INCREMENT PRIMARY KEY,
     sensorID INT NOT NULL,
 
@@ -310,7 +228,7 @@ CREATE TABLE IF NOT EXISTS SensorLog (
 -- day - one radio per Pi makes it a device property, and it is what separates a
 -- link outage from a power cut - but as an ALTER plus an agent change, not as a
 -- column sitting always-NULL.
-CREATE TABLE IF NOT EXISTS DeviceStatus (
+CREATE TABLE DeviceStatus (
     deviceID INT PRIMARY KEY,
 
     connectionStatus ENUM(
@@ -339,7 +257,7 @@ CREATE TABLE IF NOT EXISTS DeviceStatus (
 
 -- deviceID is NULLable on purpose: SERVER_START belongs to the backend, not
 -- to any one Pi.
-CREATE TABLE IF NOT EXISTS DeviceEvent (
+CREATE TABLE DeviceEvent (
     eventID BIGINT AUTO_INCREMENT PRIMARY KEY,
 
     deviceID INT NULL,
@@ -379,7 +297,7 @@ CREATE TABLE IF NOT EXISTS DeviceEvent (
 -- session idempotent - a repeated boot report produces one row, not several -
 -- and it is also what lets the backend reopen a session the watchdog closed
 -- by mistake, when the device comes back on the same bootID.
-CREATE TABLE IF NOT EXISTS DeviceSession (
+CREATE TABLE DeviceSession (
     sessionID BIGINT AUTO_INCREMENT PRIMARY KEY,
 
     deviceID INT NOT NULL,
@@ -427,7 +345,7 @@ CREATE TABLE IF NOT EXISTS DeviceSession (
 -- land on the same grid.
 -- ----------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS SamplingConfig (
+CREATE TABLE SamplingConfig (
     configID INT AUTO_INCREMENT PRIMARY KEY,
 
     periodSeconds INT NOT NULL DEFAULT 5,
@@ -462,7 +380,7 @@ CREATE TABLE IF NOT EXISTS SamplingConfig (
 -- without both a 2am fault gets stamped 8am.
 -- ----------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS ErrorLog (
+CREATE TABLE ErrorLog (
     errorID BIGINT AUTO_INCREMENT PRIMARY KEY,
     sensorID INT,
     errorType VARCHAR(50),
@@ -492,7 +410,7 @@ CREATE TABLE IF NOT EXISTS ErrorLog (
 -- Actuators
 -- ----------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS ActuatorType (
+CREATE TABLE ActuatorType (
     typeID      INT AUTO_INCREMENT PRIMARY KEY,
     typeName    VARCHAR(50) NOT NULL UNIQUE
 );
@@ -505,7 +423,7 @@ CREATE TABLE IF NOT EXISTS ActuatorType (
 -- status/statusUpdatedAt live HERE, not in a separate table. What the hardware
 -- is doing is a property of the actuator; whether the Pi reporting it is alive
 -- is a property of the Device, and that lives in DeviceStatus.
-CREATE TABLE IF NOT EXISTS Actuator (
+CREATE TABLE Actuator (
     actuatorID      INT AUTO_INCREMENT PRIMARY KEY,
     deviceID        INT NOT NULL,
     typeID          INT NOT NULL,
@@ -551,7 +469,7 @@ CREATE TABLE IF NOT EXISTS Actuator (
 -- Deliberately NOT overloaded onto pwmDutyPercent - that is DECIMAL(5,2), so it
 -- caps at 999.99, and a duty column holding a duration reads fine today and is
 -- unexplainable later.
-CREATE TABLE IF NOT EXISTS ActuatorLog (
+CREATE TABLE ActuatorLog (
     actionID        BIGINT AUTO_INCREMENT PRIMARY KEY,
     actuatorID      INT NOT NULL,
     action          ENUM('ON','OFF','SET_SPEED') NOT NULL,
@@ -590,7 +508,7 @@ CREATE TABLE IF NOT EXISTS ActuatorLog (
 
 -- locationID (M004): a rule saying "humidity < 60" without saying WHERE is not
 -- a rule, it is an ambiguity, once there are two domes. NULL means "any".
-CREATE TABLE IF NOT EXISTS ClimateRules (
+CREATE TABLE ClimateRules (
     ruleID          INT AUTO_INCREMENT PRIMARY KEY,
     ruleName        VARCHAR(100),
     locationID      INT NULL,
@@ -604,7 +522,7 @@ CREATE TABLE IF NOT EXISTS ClimateRules (
 -- durationSeconds (M004): a rule that turns the mister on has to say for how
 -- long, for the same reason a manual run does - the Pi refuses to run without
 -- an end time.
-CREATE TABLE IF NOT EXISTS ClimateRuleActuator (
+CREATE TABLE ClimateRuleActuator (
     ruleID          INT NOT NULL,
     actuatorID      INT NOT NULL,
     action          ENUM('ON','OFF','SET_SPEED') NOT NULL,
@@ -616,495 +534,34 @@ CREATE TABLE IF NOT EXISTS ClimateRuleActuator (
 );
 
 
+
 -- ============================================================================
 -- SECTION 2 - SEED DATA
 --
--- Inserted only when absent, so re-running this file does not stack up
--- duplicate defaults. SamplingConfig is append-only and the backend reads the
--- newest row, so a duplicate here would not be harmless.
+-- One SamplingConfig row and the version stamp. Nothing else - see the note in
+-- the header about why hardware is not seeded here.
 -- ============================================================================
 
+-- SamplingConfig is append-only and the backend reads the newest row, so this
+-- must be the only row in a new database. 5 s sampling, 60 s uploads.
 INSERT INTO SamplingConfig (periodSeconds, sendSeconds, effectiveFrom, active, note)
-SELECT 5, 60, 0, TRUE, 'initial default'
-WHERE NOT EXISTS (SELECT 1 FROM SamplingConfig);
+VALUES (5, 60, 0, TRUE, 'initial default');
+
+-- The version stamp. Every migration up to v3.6, recorded as applied, because
+-- the schema above IS their result. Without this a database built here would
+-- look unmigrated, and the next migration file added to the project would try
+-- to redo work that was never needed.
+INSERT INTO SchemaVersion (migrationID, description) VALUES
+  ('M001', 'SensorLog time-confidence and latency instrumentation'),
+  ('M002', 'DeviceStatus boot tracking and clock health'),
+  ('M003', 'v3af actuator rework - schema in section 1, no in-place path'),
+  ('M004', 'Mist maker: run durations, rule locations, command-poll index'),
+  ('M005', 'Device-only liveness: ActuatorStatus dropped, Actuator.deviceID FK, dead DeviceStatus columns removed'),
+  ('M006', 'SamplingConfig.sendSeconds: upload interval, separate from the sampling period');
 
 
 -- ============================================================================
--- SECTION 3 - MIGRATION HISTORY
---
--- Every migration this schema has ever had, kept rather than folded away, so
--- one file can upgrade a database as well as build one.
---
--- Each step checks information_schema before it acts, so running this twice is
--- harmless. Only prepared statements are used - no stored routines - so it
--- works for a user with plain ALTER rights and no CREATE ROUTINE privilege.
---
--- On a database Section 1 just created, every one of these is already
--- satisfied and does nothing. They earn their place on a database that was
--- created by an older version of this schema.
---
---   M001  timesync instrumentation on SensorLog
---   M002  clock health and boot tracking on DeviceStatus
---   M003  v3af actuator rework                    - see the note under M002
---   M004  mist maker: durations, rule locations, the command-poll index
---   M005  device-only liveness - THE DESTRUCTIVE ONE, see the header
---   M006  SamplingConfig.sendSeconds - the upload interval
--- ============================================================================
-
-
--- ----------------------------------------------------------------------------
--- M001 - SensorLog instrumentation  (timeSyncPlan.md §5, §7)
---
--- Appended at the END of the table on purpose so MySQL 8.0.12+ can use
--- ALGORITHM=INSTANT and finish in milliseconds instead of rebuilding the whole
--- table. ALGORITHM=INSTANT fails closed: on an older server the statement
--- errors and changes nothing, and you should drop the clause and expect a
--- rebuild.
--- ----------------------------------------------------------------------------
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SensorLog'
-           AND COLUMN_NAME = 'timeConfidence'),
-  'SELECT 1',
-  'ALTER TABLE SensorLog ADD COLUMN timeConfidence
-     ENUM(''SYNCED'',''CORRECTED'',''ESTIMATED'',''UNKNOWN'')
-     NOT NULL DEFAULT ''UNKNOWN'', ALGORITHM=INSTANT');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SensorLog'
-           AND COLUMN_NAME = 'readLatencyMs'),
-  'SELECT 1',
-  'ALTER TABLE SensorLog ADD COLUMN readLatencyMs INT NULL, ALGORITHM=INSTANT');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SensorLog'
-           AND COLUMN_NAME = 'tickJitterMs'),
-  'SELECT 1',
-  'ALTER TABLE SensorLog ADD COLUMN tickJitterMs INT NULL, ALGORITHM=INSTANT');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SensorLog'
-           AND COLUMN_NAME = 'queueDelayMs'),
-  'SELECT 1',
-  'ALTER TABLE SensorLog ADD COLUMN queueDelayMs INT NULL, ALGORITHM=INSTANT');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- syncRttMs is the round-trip delay of the clock sync in force for THAT
--- reading, captured at the tick. Added in v3, after migration_timesync.sql.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SensorLog'
-           AND COLUMN_NAME = 'syncRttMs'),
-  'SELECT 1',
-  'ALTER TABLE SensorLog ADD COLUMN syncRttMs INT NULL, ALGORITHM=INSTANT');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- recordedAt has a DEFAULT, so pre-migration rows get the value at ALTER time.
--- That is expected: rows collected before this work have no meaningful insert
--- time. Only rows written afterwards carry a real end-to-end delay.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SensorLog'
-           AND COLUMN_NAME = 'recordedAt'),
-  'SELECT 1',
-  'ALTER TABLE SensorLog ADD COLUMN recordedAt TIMESTAMP(6) NOT NULL
-     DEFAULT CURRENT_TIMESTAMP(6), ALGORITHM=INSTANT');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- Exactly-once uploads depend on this key. NOTE: if the table already holds
--- two rows with the same (sensorID, datetime) - possible on a database that
--- predates it - this ALTER fails and names the duplicate. Deduplicate first;
--- do not drop the constraint, the Pi's retry logic relies on it.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SensorLog'
-           AND INDEX_NAME = 'uq_sensorlog_reading'),
-  'SELECT 1',
-  'ALTER TABLE SensorLog ADD CONSTRAINT uq_sensorlog_reading
-     UNIQUE (sensorID, datetime)');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SensorLog'
-           AND INDEX_NAME = 'idx_sensorlog_datetime'),
-  'SELECT 1',
-  'CREATE INDEX idx_sensorlog_datetime ON SensorLog (datetime)');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-INSERT INTO SchemaVersion (migrationID, description)
-VALUES ('M001', 'SensorLog time-confidence and latency instrumentation')
-ON DUPLICATE KEY UPDATE appliedAt = appliedAt;
-
-
--- ----------------------------------------------------------------------------
--- M002 - DeviceStatus: boot tracking and clock health  (timeSyncPlan.md §6b)
---
--- Per device, not per sensor: it lets the dashboard show a Pi drifting before
--- its data is affected.
--- ----------------------------------------------------------------------------
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-           AND COLUMN_NAME = 'bootID'),
-  'SELECT 1',
-  'ALTER TABLE DeviceStatus ADD COLUMN bootID CHAR(36) NULL');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-           AND COLUMN_NAME = 'bootAt'),
-  'SELECT 1',
-  'ALTER TABLE DeviceStatus ADD COLUMN bootAt TIMESTAMP(6) NULL');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-           AND COLUMN_NAME = 'lastSyncAt'),
-  'SELECT 1',
-  'ALTER TABLE DeviceStatus ADD COLUMN lastSyncAt TIMESTAMP(6) NULL');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-           AND COLUMN_NAME = 'lastSyncOffsetMs'),
-  'SELECT 1',
-  'ALTER TABLE DeviceStatus ADD COLUMN lastSyncOffsetMs INT NULL');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-           AND COLUMN_NAME = 'lastSyncRttMs'),
-  'SELECT 1',
-  'ALTER TABLE DeviceStatus ADD COLUMN lastSyncRttMs INT NULL');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- A row has to be able to exist before the first heartbeat lands.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-           AND COLUMN_NAME = 'lastHeartbeat' AND IS_NULLABLE = 'YES'),
-  'SELECT 1',
-  'ALTER TABLE DeviceStatus MODIFY COLUMN lastHeartbeat TIMESTAMP NULL');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-INSERT INTO SchemaVersion (migrationID, description)
-VALUES ('M002', 'DeviceStatus boot tracking and clock health')
-ON DUPLICATE KEY UPDATE appliedAt = appliedAt;
-
-
--- ----------------------------------------------------------------------------
--- M003 - v3af actuator rework
---
--- NOT EXPRESSIBLE AS AN ADDITIVE MIGRATION, and deliberately not attempted.
---
--- v3af split Actuator's inline `actuatorType VARCHAR(50)` into an ActuatorType
--- table with a typeID foreign key, and added ActuatorStatus and
--- ClimateRuleActuator alongside it. Turning an existing v3 Actuator table into
--- that shape means reading every distinct actuatorType, creating a row per
--- type, rewriting each Actuator to point at it, and only then making typeID
--- NOT NULL - a data migration with a failure mode (a NULL typeID on a NOT NULL
--- column) that is worse than not starting.
---
--- It was never needed: v3 was never deployed. The live server went from v2
--- straight to v3af, built fresh.
---
--- Guard 2 in Section 0 stops this file rather than half-applying it. If you
--- ever do meet a v3 database, the honest path is: dump it, build a new one
--- with this file, and copy the rows across with an explicit type mapping.
---
--- The tables themselves are in Section 1 and are created there on any database
--- that lacks them, which covers every case except the one above.
--- ----------------------------------------------------------------------------
-
-INSERT INTO SchemaVersion (migrationID, description)
-VALUES ('M003', 'v3af actuator rework - schema in section 1, no in-place path')
-ON DUPLICATE KEY UPDATE appliedAt = appliedAt;
-
-
--- ----------------------------------------------------------------------------
--- M004 - mist maker  (was database/migration_mist.sql, plan.md §4)
---
--- Two halves: 1-2 are what the mist maker needs to work, 3-4 are climate-rule
--- groundwork that nothing reads yet.
--- ----------------------------------------------------------------------------
-
--- 1. A mist run has a length, and there was nowhere to put one.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ActuatorLog'
-           AND COLUMN_NAME = 'durationSeconds'),
-  'SELECT 1',
-  'ALTER TABLE ActuatorLog ADD COLUMN durationSeconds INT NULL AFTER pwmDutyPercent');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 2. The command poll and the two correlated MAX() subqueries in
---    GET /api/actuators all hit this.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.STATISTICS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ActuatorLog'
-           AND INDEX_NAME = 'idx_actuatorlog_lookup'),
-  'SELECT 1',
-  'CREATE INDEX idx_actuatorlog_lookup ON ActuatorLog (actuatorID, actionID)');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 3. A rule has to say WHERE. NULL means "any location", which is the only
---    sane reading of any rows that exist before this runs.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ClimateRules'
-           AND COLUMN_NAME = 'locationID'),
-  'SELECT 1',
-  'ALTER TABLE ClimateRules ADD COLUMN locationID INT NULL AFTER ruleName');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ClimateRules'
-           AND CONSTRAINT_NAME = 'fk_rule_location'),
-  'SELECT 1',
-  'ALTER TABLE ClimateRules ADD CONSTRAINT fk_rule_location
-     FOREIGN KEY (locationID) REFERENCES Location(locationID) ON DELETE CASCADE');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 4. A rule that turns the mister on has to say for how long.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ClimateRuleActuator'
-           AND COLUMN_NAME = 'durationSeconds'),
-  'SELECT 1',
-  'ALTER TABLE ClimateRuleActuator ADD COLUMN durationSeconds INT NULL');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-INSERT INTO SchemaVersion (migrationID, description)
-VALUES ('M004', 'Mist maker: run durations, rule locations, command-poll index')
-ON DUPLICATE KEY UPDATE appliedAt = appliedAt;
-
-
--- ----------------------------------------------------------------------------
--- M005 - one liveness concept per Pi   (AI Assistant/deviceAgentPlan.md)
---
--- THE ONLY DESTRUCTIVE MIGRATION IN THIS FILE. It drops a table and three
--- columns. Read the warning at the top before running this on real data.
---
--- Liveness now lives in ONE place: DeviceStatus, written by the device-agent
--- service that runs on every Pi and identifies itself by the device UUID.
--- ActuatorStatus was a second, per-actuator answer to the same question.
---
--- WHAT IS LOST: nothing that was ever written. Measured on the live server
--- before removal - powerDraw and signalStrength were 0 of 65 rows;
--- pwmDutyPercent was written to ActuatorLog in the same request that wrote it
--- to ActuatorStatus; lastHeartbeat is what DeviceStatus now carries.
--- Actuator.status / statusUpdatedAt are NOT touched - what the hardware is
--- doing stays exactly where it has always been.
---
--- WHAT IS GIVEN UP, stated so it is not rediscovered as a bug: a dead
--- relay_control.py on a Pi whose agent is still beating will read ONLINE.
--- Restart=always in mist.service is the mitigation.
---
--- Dropping Actuator.deviceUUID also removes its UNIQUE constraint, which was
--- the thing limiting one actuator per Pi. The fan and the mister can now share
--- a box, keyed on (deviceID, typeID, locationID) like Sensor.
--- ----------------------------------------------------------------------------
-
--- 1. Reconstruct any missing Device row from the UUID on the Actuator.
---
---    The old registerActuator created an Actuator but never a Device, so the
---    mist Pi has an actuator pointing at a machine the database has never heard
---    of. Everything needed to fix that is already on the row: Actuator.deviceUUID
---    IS the Pi's device_uuid.txt, the same value registerSensor would have used.
---
---    This is a one-time reconstruction of a row the old code should have
---    written, not registration - hostname and description stay NULL and the
---    Pi fills them in on its next contact.
---
---    Doing it here rather than refusing in Section 0 is what avoids a deadlock:
---    the new backend WOULD create the Device, but it cannot run against the old
---    schema, and the old backend never creates it. Neither side can go first.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-           AND COLUMN_NAME = 'deviceUUID'),
-  'INSERT INTO Device (deviceUUID)
-   SELECT DISTINCT a.deviceUUID
-     FROM Actuator a
-     LEFT JOIN Device d ON d.deviceUUID = a.deviceUUID
-    WHERE d.deviceID IS NULL
-      AND a.deviceUUID IS NOT NULL',
-  'SELECT 1');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 2. Actuator.deviceID
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-           AND COLUMN_NAME = 'deviceID'),
-  'SELECT 1',
-  'ALTER TABLE Actuator ADD COLUMN deviceID INT NULL AFTER actuatorID');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 3. Backfill deviceID. Step 1 guarantees every deviceUUID now matches a
---    Device, so this cannot leave a NULL behind.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-           AND COLUMN_NAME = 'deviceUUID'),
-  'UPDATE Actuator a
-     JOIN Device d ON d.deviceUUID = a.deviceUUID
-      SET a.deviceID = d.deviceID
-    WHERE a.deviceID IS NULL',
-  'SELECT 1');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 4. NOT NULL, so an upgraded database ends up in the same shape Section 1
---    builds on a fresh one. Skipped if any row is still NULL rather than
---    failing - a clear column state beats a confusing ALTER error.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-           AND COLUMN_NAME = 'deviceID' AND IS_NULLABLE = 'YES')
-  AND NOT EXISTS(SELECT 1 FROM Actuator WHERE deviceID IS NULL),
-  'ALTER TABLE Actuator MODIFY COLUMN deviceID INT NOT NULL',
-  'SELECT 1');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 5. What identifies an actuator, mirroring uq_sensor_identity. Includes
---    deviceID, so an Actuator row's device never changes: a different device
---    is a different row.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-           AND CONSTRAINT_NAME = 'uq_actuator_identity'),
-  'SELECT 1',
-  'ALTER TABLE Actuator
-     ADD CONSTRAINT uq_actuator_identity UNIQUE (deviceID, typeID, locationID)');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.TABLE_CONSTRAINTS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-           AND CONSTRAINT_NAME = 'fk_actuator_device'),
-  'SELECT 1',
-  'ALTER TABLE Actuator
-     ADD CONSTRAINT fk_actuator_device
-     FOREIGN KEY (deviceID) REFERENCES Device(deviceID) ON DELETE CASCADE');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 6. Drop deviceUUID. The Pi still SENDS one to /api/registerActuator - it is
---    the lookup key for the Device - it is simply no longer stored twice.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-           AND COLUMN_NAME = 'deviceUUID'),
-  'ALTER TABLE Actuator DROP COLUMN deviceUUID',
-  'SELECT 1');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
--- 7. ActuatorStatus goes. No IF-guard needed - IF EXISTS is the guard, and on
---    a fresh install Section 1 never created it.
-DROP TABLE IF EXISTS ActuatorStatus;
-
--- 8. DeviceStatus loses the two columns nothing ever wrote.
---
---    batteryLevel: inapplicable. Mains-powered Pis, and there will be no
---    battery. It is the standard pair from a battery-powered wireless-mote
---    schema, which this is not.
---
---    signalStrength: applicable and cheap, but deliberately out of scope. The
---    device agent is the natural writer for it - one radio per Pi makes RSSI a
---    device property - and adding it back is this ALTER reversed plus ~10 lines
---    reading /proc/net/wireless. What is not acceptable is keeping a column
---    with no writer: an always-NULL column is a promise the schema cannot keep.
---
---    Both were 0 of 2 rows, and GET /api/devices lists its columns explicitly,
---    so neither was ever even selected.
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-           AND COLUMN_NAME = 'batteryLevel'),
-  'ALTER TABLE DeviceStatus DROP COLUMN batteryLevel',
-  'SELECT 1');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-           AND COLUMN_NAME = 'signalStrength'),
-  'ALTER TABLE DeviceStatus DROP COLUMN signalStrength',
-  'SELECT 1');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-INSERT INTO SchemaVersion (migrationID, description)
-VALUES ('M005', 'Device-only liveness: ActuatorStatus dropped, Actuator.deviceID FK, dead DeviceStatus columns removed')
-ON DUPLICATE KEY UPDATE appliedAt = appliedAt;
-
-
--- ----------------------------------------------------------------------------
--- M006 - the upload interval  (AI Assistant/samplingIntervalPlan.md)
---
--- One additive column, so this is an ordinary migration: nothing is dropped and
--- nothing is rewritten. Existing rows take the DEFAULT 60, which is exactly the
--- interval the Pi clients had hardcoded before this, so a database upgraded
--- here behaves identically until someone changes the number.
---
--- Appended at the end of the table for ALGORITHM=INSTANT, same reasoning as
--- M001 - though SamplingConfig has a handful of rows and would rebuild in
--- milliseconds either way.
--- ----------------------------------------------------------------------------
-
-SET @s := IF(
-  EXISTS(SELECT 1 FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SamplingConfig'
-           AND COLUMN_NAME = 'sendSeconds'),
-  'SELECT 1',
-  'ALTER TABLE SamplingConfig ADD COLUMN sendSeconds INT NOT NULL DEFAULT 60');
-PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-
-INSERT INTO SchemaVersion (migrationID, description)
-VALUES ('M006', 'SamplingConfig.sendSeconds: upload interval, separate from the sampling period')
-ON DUPLICATE KEY UPDATE appliedAt = appliedAt;
-
-
--- ----------------------------------------------------------------------------
--- The v2 lineage - kept as history, deliberately NOT executed here
---
--- dashboard/migration_timesync.sql migrated the ORIGINAL v2 database
--- (`sensor_dashboard`). It is not folded into this file and must never be run
--- against a v3-family database, because v3 re-keyed the tables it touches:
---
---   DeviceStatus     v2+timesync: UNIQUE KEY on sensorID, plus lastSeen and
---                    isOnline columns.        v3.6: PRIMARY KEY deviceID,
---                    with connectionStatus instead.
---   DeviceEvent      v2+timesync: sensorID with an FK to Sensor.
---                    v3.6: deviceID with an FK to Device.
---   SamplingConfig   v2+timesync: effectiveFrom TIMESTAMP(6).
---                    v3.6: effectiveFrom BIGINT, a Unix epoch in ms, because
---                    every Pi derives its tick grid from that number.
---
--- Run it here and it would try to add a UNIQUE key on DeviceStatus(sensorID) -
--- a column v3.6 does not have - and stop with a confusing error partway
--- through. Guard 1 catches the reverse mistake, pointing this file at a v2
--- database.
---
--- The file stays in the repo as the record of how the live v2 database was
--- brought up to the timesync design. It is not part of any install path now.
--- ----------------------------------------------------------------------------
-
-
--- ============================================================================
--- SECTION 4 - OPTIONAL PERFORMANCE WORK
+-- SECTION 3 - OPTIONAL PERFORMANCE WORK
 --
 -- Not run automatically. Both matter once SensorLog is large, and the index
 -- build is a one-off 5-15 minutes on a multi-million-row table. It can be run
@@ -1133,67 +590,25 @@ ON DUPLICATE KEY UPDATE appliedAt = appliedAt;
 
 
 -- ============================================================================
--- SECTION 5 - REPORT
+-- SECTION 4 - REPORT
 -- ============================================================================
 
-SELECT 'Database_v3.6.sql complete' AS status,
-       DATABASE() AS applied_to,
+SELECT 'Database_v3.6.sql complete - fresh install' AS status,
+       DATABASE() AS created,
        VERSION()  AS mysql_version;
 
 SELECT migrationID, description, appliedAt
 FROM SchemaVersion
 ORDER BY migrationID;
 
+-- Seventeen tables, all empty except SamplingConfig (1 row) and SchemaVersion
+-- (6 rows). Anything else means this file did not finish.
 SELECT TABLE_NAME AS table_name, TABLE_ROWS AS approx_rows
 FROM information_schema.TABLES
 WHERE TABLE_SCHEMA = DATABASE()
 ORDER BY TABLE_NAME;
 
--- Sanity check. The four M004 additions and the M006 column should report 1;
--- every M005 removal should report 0. Any other combination means this file
--- did not finish.
-SELECT
-  (SELECT COUNT(*) FROM information_schema.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ActuatorLog'
-      AND COLUMN_NAME = 'durationSeconds')          AS m004_actuatorlog_duration,
-  (SELECT COUNT(*) FROM information_schema.STATISTICS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ActuatorLog'
-      AND INDEX_NAME = 'idx_actuatorlog_lookup')    AS m004_actuatorlog_index,
-  (SELECT COUNT(*) FROM information_schema.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ClimateRules'
-      AND COLUMN_NAME = 'locationID')               AS m004_climaterules_location,
-  (SELECT COUNT(*) FROM information_schema.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ClimateRuleActuator'
-      AND COLUMN_NAME = 'durationSeconds')          AS m004_ruleactuator_duration;
-
-SELECT
-  (SELECT COUNT(*) FROM information_schema.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-      AND COLUMN_NAME = 'deviceID')                 AS m005_actuator_deviceid_present,
-  (SELECT COUNT(*) FROM information_schema.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Actuator'
-      AND COLUMN_NAME = 'deviceUUID')               AS m005_actuator_uuid_gone,
-  (SELECT COUNT(*) FROM information_schema.TABLES
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ActuatorStatus')
-                                                    AS m005_actuatorstatus_gone,
-  (SELECT COUNT(*) FROM information_schema.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DeviceStatus'
-      AND COLUMN_NAME IN ('batteryLevel','signalStrength'))
-                                                    AS m005_dead_columns_gone,
-  (SELECT COUNT(*) FROM information_schema.COLUMNS
-    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'SamplingConfig'
-      AND COLUMN_NAME = 'sendSeconds')              AS m006_sendseconds_present;
-
--- One row per Pi, with what is attached to it. After M005 every actuator has a
--- deviceID, so nothing here should show a NULL device.
-SELECT d.deviceID, d.deviceUUID, d.hostname,
-       (SELECT COUNT(*) FROM Sensor s   WHERE s.deviceID = d.deviceID) AS sensors,
-       (SELECT COUNT(*) FROM Actuator a WHERE a.deviceID = d.deviceID) AS actuators,
-       st.connectionStatus, st.lastHeartbeat
-FROM Device d
-LEFT JOIN DeviceStatus st ON st.deviceID = d.deviceID
-ORDER BY d.deviceID;
-
--- Next: point the backend at this database in dashboard/backend/.env
---       (DB_NAME=...), grant the app user, restart the backend, then restart
---       every Pi - both clients cache their sensorID / actuatorID in memory.
+-- Next: grant the app user, point dashboard/backend/.env at this database
+--       (DB_NAME=sensor_dashboard_v3_6), restart the backend, then restart
+--       every Pi. Both clients register themselves on start, which is what
+--       fills Device, Sensor and Actuator.
