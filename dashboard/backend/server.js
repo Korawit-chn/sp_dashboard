@@ -1,23 +1,184 @@
+// ===========================================================================
+// App wiring. Everything that used to live in one 1507-line file is now in
+// db.js, config.js, helpers.js, deviceState.js and routes/.
+//
+// What stays here: middleware, the two routes that must not touch the database,
+// the router mounts, one error handler, and startup.
+// ===========================================================================
 require("dotenv").config();
+const path = require("path");
 const express = require("express");
-const mysql = require('mysql2/promise');
 const cors = require("cors");
+
+const { pool } = require('./db');
+const {
+  WATCHDOG_TICK_MS,
+  STARTUP_GRACE_MS,
+  SERVER_STARTED_AT,
+  MIN_PERIOD_SECONDS,
+  MAX_PERIOD_SECONDS,
+  MIN_SEND_SECONDS,
+  MAX_SEND_SECONDS,
+  OFFLINE_AFTER_MS,
+  MAX_MIST_SECONDS,
+  MAX_FAN_SECONDS
+} = require('./config');
+const { logDeviceEvent, runOfflineWatchdog } = require('./deviceState');
+
 const app = express();
 
 // MIDDLEWARE
 app.use(cors());
-app.use(express.json());
+// Backlog batches are the reason for the raised limit: 500 sensor rows is well
+// past the 100kb default, and body-parser would 413 them before any handler ran.
+app.use(express.json({ limit: '5mb' }));
 
-// MYSQL CONNECTION
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASS,
-  database: process.env.DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10
-})
 
+// ===========================================================================
+// GET / MUST KEEP RETURNING 200.
+//
+// It looks like a leftover health check. It is not: it is how every Pi finds
+// the backend. pi_common.discovery probes each address in networkList.txt with
+// route "" and takes the first that answers 200 (sensorVPD/client.py,
+// sync_clock.py). Serving the dashboard here instead - or redirecting, which is
+// a 302 - would make every Pi fail to discover a backend that is running fine.
+//
+// So the dashboard is served from /html/ below, not from /.
+// ===========================================================================
+app.get("/", (req, res) => {
+  res.send("API is running");
+});
+
+// ===========================================================================
+// The frontend, served by the backend.
+//
+// This is what removes the hand-edited backend IP from frontend/js/config.js -
+// the single most-missed install step, called out twice in the old README. The
+// page now comes from the same origin as the API, so config.js derives the base
+// URL at runtime and there is nothing to edit.
+//
+// It also removes a second npm install and a second running process: the
+// dashboard is at
+//
+//     http://<backend-host>:<PORT>/html/
+//
+// which is the same shape as the old live-server URL, with the backend's port.
+// ===========================================================================
+app.use(express.static(path.join(__dirname, '..', 'frontend')));
+
+// ===========================================================================
+// TIME SOURCE  (timeSyncPlan.md §3)
+//
+// The Pis have no RTC and no internet; this route is their clock. It must not
+// touch the database - the Pi measures round-trip delay against it, so any
+// latency added here lands directly on the sensors as clock error. That is why
+// it is here rather than in a router.
+// ===========================================================================
+app.get('/api/time', (req, res) => {
+  const now = Date.now();
+  res.json({
+    epochMs: now,
+    iso: new Date(now).toISOString()
+  });
+});
+
+// ===========================================================================
+// One place for the numbers the frontend used to hardcode.
+//
+// GET /api/devices and POST /api/heartbeat already returned offlineAfterSeconds
+// and the frontend ignored it in favour of its own constant. This is the whole
+// set, read once at page load, so the server stays the only thing that decides
+// what "too fast" and "offline" mean.
+// ===========================================================================
+app.get('/api/config', (req, res) => {
+  res.json({
+    minPeriodSeconds: MIN_PERIOD_SECONDS,
+    maxPeriodSeconds: MAX_PERIOD_SECONDS,
+    minSendSeconds: MIN_SEND_SECONDS,
+    maxSendSeconds: MAX_SEND_SECONDS,
+    offlineAfterSeconds: Math.round(OFFLINE_AFTER_MS / 1000),
+    maxMistSeconds: MAX_MIST_SECONDS,
+    maxFanSeconds: MAX_FAN_SECONDS,
+    serverEpochMs: Date.now()
+  });
+});
+
+// ROUTES
+app.use('/api', require('./routes/sensors'));
+app.use('/api', require('./routes/schedule'));
+app.use('/api', require('./routes/devices'));
+app.use('/api', require('./routes/actuators'));
+
+
+// ===========================================================================
+// One error handler for every route.
+//
+// Replaces 21 try/catch blocks ending in 17 identical 500 replies. Routes now
+// throw and asyncRoute() hands the rejection here, so the error SHAPE is
+// uniform: a 4xx a route raised deliberately keeps its own message, anything
+// else is a 500 carrying `error`. The frontend's api() reads `message` then
+// `error`, and this is the other half of that contract.
+//
+// Four arguments, and all four must be declared - that signature is how Express
+// recognises an error handler at all.
+// ===========================================================================
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  // The parent row this write points at does not exist. In this API that means
+  // exactly one thing - a Pi sent a sensorID or actuatorID from a database that
+  // has since been rebuilt - so it is a client error, not a server fault.
+  //
+  // BOTH errnos, not just one. MySQL raises 1452 (ER_NO_REFERENCED_ROW_2) when
+  // it can name the failing constraint and 1216 (ER_NO_REFERENCED_ROW) when it
+  // cannot; the message is identical either way and which one you get is not
+  // something the application controls. Measured on 8.0.45, these inserts raise
+  // 1216 - so matching only 1452 catches nothing at all.
+  //
+  // The status is load-bearing rather than cosmetic. client.py treats ANY
+  // non-200 as "retry these same rows unchanged next cycle", so a 500 wedges
+  // that Pi's upload queue permanently; 409 is what tells it to drop the stale
+  // id and re-register.
+  if (err.errno === 1452 || err.errno === 1216) {
+    console.warn(`${req.method} ${req.originalUrl}: unknown sensorID/actuatorID`);
+
+    if (res.headersSent) return next(err);
+
+    return res.status(409).json({
+      success: false,
+      message: 'unknown sensorID or actuatorID - re-register and retry',
+      error: 'unknown reference'
+    });
+  }
+
+  const status = err.status || 500;
+
+  if (status >= 500) {
+    console.error(`${req.method} ${req.originalUrl} failed:`, err);
+  }
+
+  if (res.headersSent) return next(err);
+
+  // A 4xx a route raised deliberately is written FOR the caller, so it keeps
+  // its text. A 500 is not: err.message on a database failure is raw driver
+  // output - "Unknown column 'sendSeconds' in 'field list'" - which hands the
+  // schema to anyone who can reach the port. It is still logged above, where
+  // it is just as useful for debugging and not published.
+  //
+  // Set EXPOSE_SERVER_ERRORS=1 to put it back in the response while developing.
+  const exposeInternal =
+    status < 500 || process.env.EXPOSE_SERVER_ERRORS === '1';
+
+  res.status(status).json({
+    success: false,
+    message: err.expose ? err.message : undefined,
+    error: exposeInternal ? err.message : 'internal server error'
+  });
+});
+
+
+// ===========================================================================
+// Startup
+// ===========================================================================
 async function startServer() {
   try {
     await pool.query('SELECT 1') // test DB
@@ -26,137 +187,66 @@ async function startServer() {
     console.error('Database connection failed:', err)
     process.exit(1)
   }
+
+  try {
+    await logDeviceEvent({
+      deviceID: null,
+      eventType: 'SERVER_START',
+      occurredAtMs: SERVER_STARTED_AT,
+      source: 'WATCHDOG',
+      detail: `offline detection suppressed for ${STARTUP_GRACE_MS / 1000}s`
+    })
+  } catch (err) {
+    // Missing DeviceEvent table means the schema has not been created.
+    console.warn('SERVER_START event not logged:', err.message)
+  }
+
+  // One watchdog, one table. Liveness is a property of the Pi now, reported by
+  // its device-agent service; runLivenessWatchdog() stays parameterised on the
+  // table so a second liveness domain does not mean a second copy of it.
+  setInterval(runOfflineWatchdog, WATCHDOG_TICK_MS)
 }
 startServer()
 
+// An unset PORT is not a harmless default. app.listen(undefined) binds a RANDOM
+// free port and cheerfully logs "Server running on port undefined", so the
+// backend looks healthy while every Pi and every browser fails to reach it. The
+// usual cause is starting node from the wrong directory, since dotenv resolves
+// .env relative to the working directory rather than to this file.
+if (!process.env.PORT) {
+  console.error(
+    'PORT is not set. Is dashboard/backend/.env present, and are you starting',
+    'the backend from that directory? (cd dashboard/backend && npm start)'
+  );
+  process.exit(1);
+}
 
-
-// test
-app.get("/", (req, res) => {
-  res.send("API is running");
-});
-
-// GET all sensors
-app.get('/api/sensors', async (req, res) => {
-  const [rows] = await pool.query('SELECT * FROM Sensor')
-  res.json(rows)
-})
-
-// GET logs for last X hours
-// app.get('/api/logs', async (req, res) => {
-//   const hours = req.query.hours || 2
-
-//   const [rows] = await pool.query(`
-//     SELECT s.sensorID, s.sensorType, s.sensorLocation,
-//            l.datetime, l.temperature, l.humidity, l.windspeed, l.VPD
-//     FROM SensorLog l
-//     JOIN Sensor s ON s.sensorID = l.sensorID
-//     WHERE l.datetime >= NOW() - INTERVAL ? HOUR
-//     ORDER BY l.datetime
-//   `, [hours])
-
-//   res.json(rows)
-// })
-
-app.get('/api/logs', async (req, res) => {
-  const { hours, start, end } = req.query
-
-  let query = `
-    SELECT s.sensorID, s.sensorType, s.sensorLocation,
-           l.datetime, l.temperature, l.humidity,
-           l.windspeed, l.windDirection, l.VPD
-    FROM SensorLog l
-    JOIN Sensor s ON s.sensorID = l.sensorID
-    WHERE 1=1
-  `
-  const params = []
-
-  if (start && end) {
-    query += ` AND l.datetime BETWEEN ? AND ?`
-    params.push(start, end)
-  } else {
-    query += ` AND l.datetime >= NOW() - INTERVAL ? HOUR`
-    params.push(hours || 6)
-  }
-
-  query += ` ORDER BY l.datetime`
-
-  const [rows] = await pool.query(query, params)
-  res.json(rows)
-})
-
-app.post('/api/getDataDHT', async (req, res) => {
-  try {
-    const { sensorID, temperature, humidity, VPD, time } = req.body;
-
-    if (sensorID == null || temperature == null || humidity == null || VPD == null || time == null ) {
-      return res.status(400).json({ message: 'Missing DHT data' });
-    }
-
-    const sql = `
-      INSERT INTO SensorLog
-      (sensorID, datetime, temperature, humidity, VPD)
-      VALUES (?, ?, ?, ?, ?)
-    `;
-
-    const [result] = await pool.execute(sql, [
-      sensorID,
-      time,
-      temperature,
-      humidity,
-      VPD
-    ]);
-
-    res.status(200).json({
-      success: true,
-      logID: result.insertId
-    });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post('/api/getDataC5A', async (req, res) => {
-  try {
-    const { sensorID, windSpeed, windDirection, time } = req.body;
-
-    if (
-      sensorID == null ||
-      windSpeed == null ||
-      windDirection == null ||
-      time == null
-    ) {
-      return res.status(400).json({ message: 'Missing C5A data' });
-    }
-
-    const sql = `
-      INSERT INTO SensorLog
-      (sensorID, datetime, windspeed, windDirection)
-      VALUES (?, ?, ?, ?)
-    `;
-
-    const [result] = await pool.execute(sql, [
-      sensorID,
-      time,
-      windSpeed,
-      windDirection,
-    ]);
-
-    res.status(200).json({
-      success: true,
-      logID: result.insertId
-    });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-
-// START SERVER
-app.listen(process.env.PORT, "0.0.0.0", () => {
+const server = app.listen(process.env.PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${process.env.PORT}`);
+});
+
+// Without this handler a bind failure is an unhandled 'error' event: node dumps
+// a raw stack trace and dies, which reads like a crash in the application
+// rather than "something else already has that port". The database check above
+// already fails with a plain sentence; this is the other half of that.
+//
+// EACCES is not just a privileged-port problem on Windows. Hyper-V and WSL
+// reserve dynamic port RANGES, those ranges move on reboot, and a port that
+// falls inside one refuses to bind for no visible reason - measured here, where
+// 5099 was blocked while 5000 was fine.
+server.on('error', (err) => {
+  const port = process.env.PORT;
+
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${port} is already in use - another backend is probably running.`);
+  } else if (err.code === 'EACCES') {
+    console.error(
+      `Not allowed to bind port ${port}. On Windows, check the reserved ranges with:\n` +
+      `  netsh interface ipv4 show excludedportrange protocol=tcp`
+    );
+  } else {
+    console.error(`Could not listen on port ${port}:`, err.message);
+  }
+
+  process.exit(1);
 });

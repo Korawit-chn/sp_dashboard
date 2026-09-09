@@ -1,6 +1,24 @@
-const API = window.CONFIG.API
+// =====================
+// Temperature / Humidity / VPD charts
+//
+// The three charts are one chart built three times. SERIES is the only thing
+// that differs between them, so a fourth chart is a row in that table plus a
+// <canvas> in index.html - not another 60 lines.
+//
+// API, getSelectedSensors(), sensorNameOf() and api() come from common.js.
+// =====================
 
-let chart = null
+const SERIES = [
+  { canvas: "tempChart", field: "temperature", label: "Temp (C)" },
+  { canvas: "humiChart", field: "humidity",    label: "Humidity (%)" },
+  { canvas: "VPDChart",  field: "VPD",         label: "VPD (kPa)" }
+]
+
+// canvas id -> Chart instance. These used to be three implicit globals created
+// by assignment inside the build functions, which worked only because this file
+// is not in strict mode.
+const charts = {}
+
 let allData = []
 let sensorsCreated = false
 
@@ -9,16 +27,21 @@ let sensorsCreated = false
 // Load data
 // =====================
 async function loadData() {
-  const res = await fetch(`${API}/logs?hours=2`)
-  allData = await res.json()
+  try {
+    const rows = await api(`/logs?hours=2`)
+    allData = rows.map(d => ({ ...d, sensorName: sensorNameOf(d) }))
+  } catch (err) {
+    console.error("logs unavailable:", err.message)
+    return
+  }
 
   if (!sensorsCreated) {
     createSensorCheckboxes()
-    buildChart()
+    buildCharts()
     sensorsCreated = true
   }
 
-  updateChart()
+  updateCharts()
 }
 
 
@@ -26,7 +49,7 @@ async function loadData() {
 // Create sensor toggles
 // =====================
 function createSensorCheckboxes() {
-  const sensors = [...new Set(allData.map(d => d.sensorType))]
+  const sensors = [...new Set(allData.map(d => d.sensorName))]
   const container = document.getElementById("checkboxes")
 
   container.innerHTML = ""
@@ -39,43 +62,41 @@ function createSensorCheckboxes() {
       ${name}
     `
 
-    label.onchange = updateChart
+    label.onchange = updateCharts
     container.appendChild(label)
   })
-
-  // metric toggles
-  document.querySelectorAll("#metrics input")
-    .forEach(cb => cb.onchange = updateChart)
 }
 
 
 // =====================
-// Build chart once
+// Build charts once
 // =====================
-function buildChart() {
-  chart = new Chart(document.getElementById("chart"), {
-    type: "line",
-    data: { datasets: [] },
-    options: {
-      animation: false,
-      responsive: true,
-      interaction: {
-        mode: "nearest",
-        intersect: false
-      },
-      scales: {
-        x: {
-          type: "time",
-          time: { unit: "minute" }
+function buildCharts() {
+  SERIES.forEach(series => {
+    charts[series.canvas] = new Chart(document.getElementById(series.canvas), {
+      type: "line",
+      data: { datasets: [] },
+      options: {
+        animation: false,
+        responsive: true,
+        interaction: {
+          mode: "nearest",
+          intersect: false
         },
-        y: {
-          title: {
-            display: true,
-            text: "Value"
+        scales: {
+          x: {
+            type: "time",
+            time: { unit: "minute" }
+          },
+          y: {
+            title: {
+              display: true,
+              text: series.label
+            }
           }
         }
       }
-    }
+    })
   })
 }
 
@@ -83,67 +104,24 @@ function buildChart() {
 // =====================
 // Update datasets
 // =====================
-function updateChart() {
-  const selectedSensors =
-    [...document.querySelectorAll("#checkboxes input:checked")]
-      .map(c => c.value)
+function updateCharts() {
+  // Read the checkboxes once for all three charts, not once per chart.
+  const selectedSensors = getSelectedSensors()
 
-  const selectedMetrics =
-    [...document.querySelectorAll("#metrics input:checked")]
-      .map(c => c.value)
+  SERIES.forEach(series => {
+    const chart = charts[series.canvas]
+    if (!chart) return
 
-  const datasets = []
+    chart.data.datasets = selectedSensors.map(sensor => ({
+      label: sensor,
+      data: allData
+        .filter(d => d.sensorName === sensor && d[series.field] !== null)
+        .map(d => ({ x: new Date(d.datetime), y: d[series.field] })),
+      fill: false
+    }))
 
-  selectedSensors.forEach(sensor => {
-
-    const sensorData = allData.filter(d => d.sensorType === sensor)
-
-    // Temperature
-    if (selectedMetrics.includes("temperature")) {
-      datasets.push({
-        label: `${sensor} (Temp)`,
-        data: sensorData
-          .filter(d => d.temperature !== null)
-          .map(d => ({
-            x: new Date(d.datetime),
-            y: d.temperature
-          })),
-        fill: false
-      })
-    }
-
-    // Humidity
-    if (selectedMetrics.includes("humidity")) {
-      datasets.push({
-        label: `${sensor} (Humidity)`,
-        data: sensorData
-          .filter(d => d.humidity !== null)
-          .map(d => ({
-            x: new Date(d.datetime),
-            y: d.humidity
-          })),
-        fill: false
-      })
-    }
-
-    // VPD
-    if (selectedMetrics.includes("VPD")) {
-      datasets.push({
-        label: `${sensor} (VPD)`,
-        data: sensorData
-          .filter(d => d.VPD !== null)
-          .map(d => ({
-            x: new Date(d.datetime),
-            y: d.VPD
-          })),
-        fill: false
-      })
-    }
-
+    chart.update()
   })
-
-  chart.data.datasets = datasets
-  chart.update()
 }
 
 
@@ -151,5 +129,4 @@ function updateChart() {
 // Start
 // =====================
 loadData()
-setInterval(loadData, 5000)
-
+setInterval(loadData, 2500)
