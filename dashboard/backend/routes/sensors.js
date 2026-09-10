@@ -276,33 +276,190 @@ const SENSORLOG_INSERT_PREFIX =
 // row - so the single-row routes worked and every batch failed.
 const SENSORLOG_INSERT_SUFFIX = ' ON DUPLICATE KEY UPDATE sensorID = sensorID';
 
-/** Maps a request body row onto SENSORLOG_COLUMNS. Returns null if invalid. */
-function toSensorLogValues(row) {
+// Bounds taken straight from the SensorLog column types. A value outside them
+// is rejected by MySQL under STRICT_TRANS_TABLES (confirmed in sql_mode on the
+// 8.0.45 server), and because a batch is ONE multi-row INSERT, a single bad
+// value takes all 500 rows of that statement with it.
+//
+// That is not merely a lost batch. client.py only retires rows on a 200, so the
+// failure returns a 500, the Pi retries the SAME rows next cycle, gets the same
+// 500, and that queue never drains again - the identical trap the errno
+// 1452/1216 handler in server.js was written for. Checking here is what keeps
+// one corrupt reading a one-row loss instead of a dead sensor.
+//
+// A corrupt C5A frame is the concrete case: C5A.py builds a reading as
+// int.from_bytes(data[6:8]) * 0.1, so a mangled frame yields up to 6553.5 -
+// fine as a number, impossible as DECIMAL(5,2).
+const DECIMAL_5_2_MAX = 999.99;    // temperature, humidity, windspeed
+const DECIMAL_6_2_MAX = 9999.99;   // VPD
+const INT_MAX = 2147483647;        // windDirection
+
+// TIMESTAMP spans 1970-01-01 .. 2038-01-19 and the column is stored in the
+// server's timezone. A day of slack at each end means a legitimate reading near
+// the boundary cannot be thrown out by a timezone offset, while the values this
+// is aimed at - epoch 0 from a Pi that never got a clock, or a garbage
+// far-future date - are still caught.
+const TIMESTAMP_MIN_MS = Date.UTC(1970, 0, 2);
+const TIMESTAMP_MAX_MS = Date.UTC(2038, 0, 18);
+
+/** A description of why `value` cannot be stored, or null if it can. */
+function numberFault(name, value, limit) {
+  if (value == null) return null;   // the column is nullable; absent is fine
+
+  const n = Number(value);
+
+  // NaN and Infinity arrive as non-finite: vpd_kpa() on a corrupt frame is how
+  // this shows up, since es grows exponentially with temperature.
+  if (!Number.isFinite(n)) {
+    return `${name} is not a finite number (${JSON.stringify(value)})`;
+  }
+
+  if (Math.abs(n) > limit) {
+    return `${name} ${n} out of range for the column (max ${limit})`;
+  }
+
+  return null;
+}
+
+function datetimeFault(time) {
+  const ms = toEpochMs(time);
+
+  if (ms == null) return `time is not a date (${JSON.stringify(time)})`;
+
+  if (ms < TIMESTAMP_MIN_MS || ms > TIMESTAMP_MAX_MS) {
+    return `time ${JSON.stringify(time)} is outside the TIMESTAMP range`;
+  }
+
+  return null;
+}
+
+/**
+ * Maps a request body row onto SENSORLOG_COLUMNS.
+ *
+ * Returns `{ values }` for a row that can be stored, or `{ fault }` naming the
+ * first thing wrong with it. The fault text goes into ErrorLog, so it has to
+ * say which field and what the value was - "invalid row", read six hours
+ * later, does not tell you which sensor is misbehaving.
+ */
+function mapSensorLogRow(row) {
   const { sensorID, temperature, humidity, VPD, time } = row;
 
   if (sensorID == null || temperature == null || humidity == null ||
       VPD == null || time == null) {
-    return null;
+    return { fault: 'missing sensorID, temperature, humidity, VPD or time' };
   }
+
+  const windspeed = row.windSpeed ?? row.windspeed ?? null;
+
+  const fault =
+    datetimeFault(time) ||
+    numberFault('temperature', temperature, DECIMAL_5_2_MAX) ||
+    numberFault('humidity', humidity, DECIMAL_5_2_MAX) ||
+    numberFault('VPD', VPD, DECIMAL_6_2_MAX) ||
+    numberFault('windspeed', windspeed, DECIMAL_5_2_MAX) ||
+    numberFault('windDirection', row.windDirection, INT_MAX);
+
+  if (fault) return { fault };
 
   const confidence = TIME_CONFIDENCE.includes(row.timeConfidence)
     ? row.timeConfidence
     : 'UNKNOWN';
 
-  return [
-    sensorID,
-    time,
-    temperature,
-    humidity,
-    row.windSpeed ?? row.windspeed ?? null,
-    row.windDirection ?? null,
-    VPD,
-    confidence,
-    toInt(row.readLatencyMs),
-    toInt(row.tickJitterMs),
-    toInt(row.queueDelayMs),
-    toInt(row.syncRttMs)
-  ];
+  return {
+    values: [
+      sensorID,
+      time,
+      temperature,
+      humidity,
+      windspeed,
+      row.windDirection ?? null,
+      VPD,
+      confidence,
+      toInt(row.readLatencyMs),
+      toInt(row.tickJitterMs),
+      toInt(row.queueDelayMs),
+      toInt(row.syncRttMs)
+    ]
+  };
+}
+
+// ===========================================================================
+// Corrupt readings
+//
+// A refused row is DISCARDED - it can never be stored, so keeping it would
+// wedge the queue it sits in. Discarding it silently would mean a sensor could
+// degrade for a week with nothing to show for it, so it is recorded in
+// ErrorLog first and only then dropped from SensorLog.
+// ===========================================================================
+
+const DATA_CORRUPT = 'data corrupt';
+
+// Errors meaning "this DATA cannot be stored", as opposed to a server or
+// connection fault. Matching errnos is a backstop, not the mechanism:
+// mapSensorLogRow() is meant to catch these before MySQL ever sees them, and
+// the 1452/1216 note in server.js is the standing warning that which errno you
+// get is not something the application controls.
+const DATA_FAULT_ERRNOS = new Set([
+  1264,  // ER_WARN_DATA_OUT_OF_RANGE
+  1265,  // WARN_DATA_TRUNCATED
+  1292,  // ER_TRUNCATED_WRONG_VALUE - a datetime that will not parse
+  1366,  // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+  1406   // ER_DATA_TOO_LONG
+]);
+
+const isDataFault = (err) => DATA_FAULT_ERRNOS.has(err.errno);
+
+/**
+ * Record one refused reading, stamped with the time the READING was taken.
+ *
+ * occurredAt, not createdAt: createdAt is when the server happened to receive
+ * it, so a backlog replayed after six hours offline would file every corrupt
+ * row under the moment the network came back. The point of the record is to
+ * find when the sensor actually misbehaved.
+ *
+ * Never throws. It runs while answering a request whose whole purpose is to
+ * stop one bad row taking the others down; letting the bookkeeping fail the
+ * response would rebuild the exact trap it exists to remove.
+ */
+async function logCorruptRow({ sensorID, fault, time, timeConfidence }) {
+  // If the TIME is what is corrupt it cannot go into a TIMESTAMP either, so the
+  // column is left NULL and the raw value is kept in the message instead.
+  const badTime = datetimeFault(time);
+  const occurredAt = badTime ? null : toSqlDateTime(toEpochMs(time));
+
+  const confidence = TIME_CONFIDENCE.includes(timeConfidence)
+    ? timeConfidence
+    : 'UNKNOWN';
+
+  const message = badTime ? `${fault} (raw time ${JSON.stringify(time)})` : fault;
+
+  const sql = `
+    INSERT INTO ErrorLog
+      (sensorID, errorType, errorMessage, severity, occurredAt, timeConfidence)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `;
+
+  try {
+    await pool.execute(sql,
+      [sensorID ?? null, DATA_CORRUPT, message, 'MEDIUM', occurredAt, confidence]);
+    return;
+  } catch (err) {
+    // ErrorLog.sensorID carries the same foreign key SensorLog does, so a row
+    // from a rebuilt database fails here for the reason it failed there. The
+    // reading is still worth recording; only the link to a sensor is not.
+    if (err.errno !== 1452 && err.errno !== 1216) {
+      console.error('ErrorLog write failed:', err.code || err.message);
+      return;
+    }
+  }
+
+  try {
+    await pool.execute(sql,
+      [null, DATA_CORRUPT, `${message} (from unknown sensorID ${sensorID})`,
+       'MEDIUM', occurredAt, confidence]);
+  } catch (err) {
+    console.error('ErrorLog write failed:', err.code || err.message);
+  }
 }
 
 // ===========================================================================
@@ -324,15 +481,33 @@ function singleRowUpload(label, requiredFields) {
       }
     }
 
-    const values = toSensorLogValues(req.body);
+    const mapped = mapSensorLogRow(req.body);
 
-    if (!values) {
-      return res.status(400).json({ message: `Missing ${label} data` });
+    if (mapped.fault) {
+      await logCorruptRow({
+        sensorID: req.body.sensorID,
+        fault: mapped.fault,
+        time: req.body.time,
+        timeConfidence: req.body.timeConfidence
+      });
+
+      // 200, not 400, and the status is load-bearing for the same reason the
+      // 409 in server.js is: _send_one_by_one() in client.py stops its loop on
+      // ANY non-200 and leaves the row unretired, so a 400 on a row that can
+      // never succeed is retried unchanged forever and wedges that queue. The
+      // reading is refused either way - `rejected` is how the Pi is told, and
+      // ErrorLog above is where the evidence lives.
+      return res.status(200).json({
+        success: true,
+        rejected: true,
+        stored: 0,
+        message: `${label} row rejected as corrupt: ${mapped.fault}`
+      });
     }
 
     const [result] = await pool.execute(
       SENSORLOG_INSERT_PREFIX + SENSORLOG_PLACEHOLDERS + SENSORLOG_INSERT_SUFFIX,
-      values
+      mapped.values
     );
 
     res.status(200).json({
@@ -372,36 +547,99 @@ router.post('/sensorLogBatch', asyncRoute(async (req, res) => {
     });
   }
 
-  const values = [];
-  const rejected = [];
+  const accepted = [];   // { index, values, row } for rows that can be stored
+  const rejected = [];   // indices into `rows`, which is what the Pi reads
+  const corrupt = [];    // rows to record in ErrorLog before they are dropped
 
   rows.forEach((row, i) => {
-    const mapped = toSensorLogValues(row);
-    if (mapped) {
-      values.push(mapped);
-    } else {
+    const mapped = mapSensorLogRow(row);
+
+    if (mapped.fault) {
       rejected.push(i);
+      corrupt.push({
+        sensorID: row.sensorID,
+        fault: mapped.fault,
+        time: row.time,
+        timeConfidence: row.timeConfidence
+      });
+      return;
     }
+
+    accepted.push({ index: i, values: mapped.values, row });
   });
 
-  if (values.length === 0) {
-    return res.status(400).json({ success: false, message: 'no valid rows', rejected });
+  let stored = 0;
+  let firstLogID = null;
+
+  if (accepted.length > 0) {
+    const sql = SENSORLOG_INSERT_PREFIX +
+      accepted.map(() => SENSORLOG_PLACEHOLDERS).join(', ') +
+      SENSORLOG_INSERT_SUFFIX;
+
+    try {
+      const [result] = await pool.query(sql, accepted.flatMap(a => a.values));
+      stored = result.affectedRows;
+      firstLogID = result.insertId;
+    } catch (err) {
+      // mapSensorLogRow() is supposed to have caught every one of these, so
+      // reaching here means a value it does not know about. Rather than let one
+      // row lose the other 499 - and wedge the queue behind them - insert them
+      // one at a time to find out which. Slow, and it only runs when something
+      // has already gone wrong.
+      if (!isDataFault(err)) throw err;
+
+      console.warn(`sensorLogBatch: ${err.code} in a batch of ${accepted.length}` +
+                   ` - isolating rows`);
+
+      for (const entry of accepted) {
+        try {
+          const [one] = await pool.execute(
+            SENSORLOG_INSERT_PREFIX + SENSORLOG_PLACEHOLDERS + SENSORLOG_INSERT_SUFFIX,
+            entry.values
+          );
+          stored += one.affectedRows;
+          if (firstLogID === null && one.insertId) firstLogID = one.insertId;
+        } catch (rowErr) {
+          if (!isDataFault(rowErr)) throw rowErr;
+
+          rejected.push(entry.index);
+          corrupt.push({
+            sensorID: entry.row.sensorID,
+            fault: `refused by the database: ${rowErr.code} - ${rowErr.sqlMessage}`,
+            time: entry.row.time,
+            timeConfidence: entry.row.timeConfidence
+          });
+        }
+      }
+    }
   }
 
-  const sql = SENSORLOG_INSERT_PREFIX +
-    values.map(() => SENSORLOG_PLACEHOLDERS).join(', ') +
-    SENSORLOG_INSERT_SUFFIX;
+  // Sequential, not Promise.all: a batch is normally all-good and this loop
+  // does nothing, while the case it does run for is a sensor emitting garbage -
+  // exactly when firing 500 concurrent inserts at the pool is least welcome.
+  for (const entry of corrupt) {
+    await logCorruptRow(entry);
+  }
 
-  const [result] = await pool.query(sql, values.flat());
+  if (corrupt.length > 0) {
+    console.warn(`sensorLogBatch: ${corrupt.length} of ${rows.length} rows ` +
+                 `recorded as "${DATA_CORRUPT}" and dropped`);
+  }
 
-  // `inserted` counts rows accepted, which is what the Pi needs to know to
-  // clear them from its cache. `stored` excludes duplicates the unique key
-  // absorbed - a replayed backlog can legitimately be all duplicates.
+  // 200 even when EVERY row was corrupt. This used to answer 400 'no valid
+  // rows', which the Pi treats like any other non-200 - it left them unretired
+  // and re-sent the same all-bad batch every cycle, forever. A row that can
+  // never be stored has to be reported as handled, or it blocks the ones behind
+  // it; `rejected` is what says it was not kept.
+  //
+  // `inserted` counts rows the Pi may clear from its cache. `stored` excludes
+  // duplicates the unique key absorbed - a replayed backlog can legitimately be
+  // all duplicates.
   res.status(200).json({
     success: true,
-    inserted: values.length,
-    stored: result.affectedRows,
-    firstLogID: result.insertId,
+    inserted: rows.length - rejected.length,
+    stored,
+    firstLogID,
     rejected
   });
 
