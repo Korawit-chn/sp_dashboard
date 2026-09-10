@@ -10,10 +10,9 @@
 const MIST_TYPE = "Mist Maker"
 const FAN_TYPE = "FAN"
 
-// Placeholder run lengths, one per actuator type. A mist run is measured in
-// seconds of water; a fan run is a ventilation cycle, so a minute of it would
-// barely move the air in the dome.
-const DEFAULT_FAN_RUN_SECONDS = 300
+// Neither panel carries a default run length any more. Both duration boxes
+// start empty, and empty now MEANS something - run until Stop - so filling one
+// in with a suggested number would quietly pick the other mode for the user.
 
 
 // =====================
@@ -276,7 +275,8 @@ const updateFan = createPicker({
     durationInput.max = String(SERVER_CONFIG.maxFanSeconds)
     durationInput.step = "1"
     durationInput.size = 5
-    durationInput.placeholder = DEFAULT_FAN_RUN_SECONDS
+    // Blank is a real choice, not a missing value - same as the mist maker.
+    durationInput.placeholder = "∞"
 
     readout.textContent = "0%"
     startButton.textContent = "Start"
@@ -299,19 +299,32 @@ const updateFan = createPicker({
       if (!fan) return
 
       const duty = Number(slider.value)
-      const seconds = Number(durationInput.value) || DEFAULT_FAN_RUN_SECONDS
+      const seconds = Number(durationInput.value)
+
+      // An empty box asks for a run with no timer, and the field is OMITTED to
+      // say so - the server stores a missing duration as NULL and the Pi reads
+      // NULL as "no deadline, spin until something stops me". Sending 0 would
+      // mean something else entirely: run_until() reads a non-positive
+      // duration as malformed and answers with MaxRun.
+      //
+      // A fan started this way does not stop by itself if this dashboard goes
+      // away mid-run. Same trade as the mist maker's blank box.
+      const command = {
+        actuatorID: fan.actuatorID,
+        action: "SET_SPEED",
+        pwmDutyPercent: duty
+      }
+
+      if (seconds > 0) command.durationSeconds = seconds
 
       sendCommand(
-        {
-          actuatorID: fan.actuatorID,
-          action: "SET_SPEED",
-          pwmDutyPercent: duty,
-          durationSeconds: seconds
-        },
+        command,
         status,
         // Report what was STORED, not what was asked for: the server clamps
         // the duration to its own maximum and the Pi clamps it again.
-        body => `queued - ${duty}% for ${body.durationSeconds}s`
+        body => body.durationSeconds == null
+          ? `queued - ${duty}% until Stop`
+          : `queued - ${duty}% for ${body.durationSeconds}s`
       )
     }
 
@@ -335,7 +348,8 @@ const updateFan = createPicker({
 
     const row = document.createElement("div")
     row.append("Speed ", slider, " ", readout,
-               " for ", durationInput, " seconds ", startButton, " ", stopButton)
+               " for ", durationInput, " seconds (blank = until Stop) ",
+               startButton, " ", stopButton)
     return row
   },
 

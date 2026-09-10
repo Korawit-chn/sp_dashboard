@@ -115,17 +115,21 @@ router.post('/actuatorCommand', asyncRoute(async (req, res) => {
   // DURATION_CAP_SECONDS. Clamped rather than rejected: a caller asking a
   // mister for an hour gets ten minutes, which is the safe reading.
   //
-  // Absent is stored as NULL, and what that means is now per-device:
+  // Absent is stored as NULL, and NULL means "no deadline" for both devices
+  // now: the mister runs until an OFF arrives, the fan until an OFF or a
+  // SET_SPEED of 0. A run started that way does NOT stop on its own if this
+  // server or the network goes away mid-run. That is deliberate on both - see
+  // RUNS WITH NO DEADLINE in mist_relay_control.py and the header of
+  // fan_control.py.
   //
-  //   mist (ON)        no deadline. The relay runs until an OFF arrives, so a
-  //                    run started this way does NOT stop on its own if this
-  //                    server or the network goes away mid-run. Deliberate -
-  //                    see RUNS WITH NO DEADLINE in mist_relay_control.py.
-  //   fan (SET_SPEED)  the Pi substitutes its own MaxRun from config_fan.txt,
-  //                    so a fan still cannot be left spinning untimed.
+  // A duration that IS given is clamped here and clamped again on the Pi from
+  // config.txt / config_fan.txt, and that remains the form which survives an
+  // outage, because the second clamp lives on the half that still works when
+  // this server disappears.
   //
-  // Either way the fallback lives on the Pi, which is the half that still
-  // works when this server disappears.
+  // Only a MISSING duration means no timer. A zero or a negative is a
+  // malformed request, and both Pis answer it with their own MaxRun rather
+  // than letting it become a run with no end.
   const cap = DURATION_CAP_SECONDS[action];
   const requestedDuration = toInt(req.body.durationSeconds);
   const durationSeconds = (cap == null || requestedDuration == null || requestedDuration <= 0)
