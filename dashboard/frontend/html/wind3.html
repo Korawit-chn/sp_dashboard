@@ -3,8 +3,17 @@
 <head>
   <title>Wind Speed Dashboard</title>
 
-  <script src="https://cdn.jsdelivr.net/npm/echarts/dist/echarts.min.js"></script>
+  <!-- Vendored, NOT a CDN. The site has no internet, and these used to load
+       from cdn.jsdelivr.net - which meant the BROWSER had to reach the
+       internet, not the server. It worked until the browser's cache of them
+       expired (the URLs were unversioned, so jsDelivr caches them for about a
+       week), and then every chart silently stopped drawing while the rest of
+       the page carried on. Served by express.static out of frontend/, so
+       nothing but these paths has to change. See js/vendor/README.md. -->
+  <script src="../js/vendor/echarts.min.js"></script>
 
+
+  <link rel="stylesheet" href="../style.css">
 
   <style>
     #chartContainer {
@@ -28,28 +37,11 @@
 
   <h2>Wind Speed Dashboard</h2>
 
-  <div id="timeControls" style="margin-bottom:10px;">
-    <label>
-      Time range:
-      <select id="timeSelect">
-        <option value="hours">Last 6 hours</option>
-        <option value="custom">Custom range</option>
-        <option value="fromNow">From time → Now</option>
-      </select>
-    </label>
-
-    <span id="customRange" style="display:none;">
-      <input type="datetime-local" id="startTime">
-      →
-      <input type="datetime-local" id="endTime">
-      <button id="applyTime">Apply</button>
-    </span>
-
-    <span id="fromNowRange" style="display:none;">
-      <input type="datetime-local" id="fromTime">
-      <button id="applyFromNow">Apply</button>
-    </span>
-  </div>
+  <!-- Built by renderTimeControls() in js/common.js - the same control the
+       main page uses. It used to be hand-written markup here plus
+       setupTimeControls() in wind3.js, which the main page had no copy of at
+       all. -->
+  <div id="timeControls" class="panel"></div>
 
 
   <div id="checkboxes"></div>
@@ -61,8 +53,9 @@
 
 
 
-  <!-- config.js then common.js first - see index.html. -->
+  <!-- config.js, sensorColors.js, then common.js - see index.html. -->
   <script src="../js/config.js"></script>
+  <script src="../js/sensorColors.js"></script>
   <script src="../js/common.js"></script>
   <script src="../js/wind3.js"></script>
 </body>

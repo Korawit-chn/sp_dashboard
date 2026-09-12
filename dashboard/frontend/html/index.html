@@ -7,8 +7,15 @@
 <head>
   <title>Sensor Dashboard</title>
 
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+  <!-- Vendored, NOT a CDN. The site has no internet, and these used to load
+       from cdn.jsdelivr.net - which meant the BROWSER had to reach the
+       internet, not the server. It worked until the browser's cache of them
+       expired (the URLs were unversioned, so jsDelivr caches them for about a
+       week), and then every chart silently stopped drawing while the rest of
+       the page carried on. Served by express.static out of frontend/, so
+       nothing but these paths has to change. See js/vendor/README.md. -->
+  <script src="../js/vendor/chart.umd.min.js"></script>
+  <script src="../js/vendor/chartjs-adapter-date-fns.bundle.min.js"></script>
   <link rel="stylesheet" href="../style.css">
 </head>
 
@@ -56,6 +63,9 @@
     <tbody></tbody>
   </table>
 
+  <h3>Time range</h3>
+  <div id="timeControls" class="panel"></div>
+
   <h3>Sensors</h3>
   <div id="checkboxes"></div>
 
@@ -68,10 +78,13 @@
   <h3>VPD</h3>
   <canvas id="VPDChart" height="100"></canvas>
 
-  <!-- config.js then common.js first: common.js reads window.CONFIG and defines
-       API, api(), formatAge(), toNumber() and getSelectedSensors(). The three
-       panel scripts below are independent of each other and may be reordered. -->
+  <!-- config.js, then sensorColors.js, then common.js: common.js reads
+       window.CONFIG and defines API, api(), formatAge(), toNumber(),
+       getSelectedSensors() and renderSensorCheckboxes(), and that last one
+       calls sensorColor(). The three panel scripts below are independent of
+       each other and may be reordered. -->
   <script src="../js/config.js"></script>
+  <script src="../js/sensorColors.js"></script>
   <script src="../js/common.js"></script>
   <script src="../js/devices.js"></script>
   <script src="../js/actuators.js"></script>

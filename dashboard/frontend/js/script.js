@@ -5,7 +5,9 @@
 // that differs between them, so a fourth chart is a row in that table plus a
 // <canvas> in index.html - not another 60 lines.
 //
-// API, getSelectedSensors(), sensorNameOf() and api() come from common.js.
+// API, getSelectedSensors(), sensorListOf(), renderSensorCheckboxes(),
+// renderTimeControls(), currentTimeQuery(), startPolling() and api() come from
+// common.js; sensorColor() from sensorColors.js.
 // =====================
 
 const SERIES = [
@@ -20,7 +22,17 @@ const SERIES = [
 const charts = {}
 
 let allData = []
-let sensorsCreated = false
+
+// The sensorIDs the checkbox list was last built for. It used to be a boolean -
+// built once, never again - which was fine when the window was a hardcoded two
+// hours. With a time picker, widening the range can bring in a sensor that was
+// not reporting during the old one, and it has to appear in the list.
+let sensorKey = null
+
+// sensorID -> display name. Refreshed with the data so a sensor that is renamed
+// or relocated picks the new label up, and so updateCharts() does not rescan
+// every row to find one name three times a refresh.
+let sensorNames = new Map()
 
 
 // =====================
@@ -28,18 +40,25 @@ let sensorsCreated = false
 // =====================
 async function loadData() {
   try {
-    const rows = await api(`/logs?hours=2`)
+    const rows = await api(`/logs${currentTimeQuery()}`)
     allData = rows.map(d => ({ ...d, sensorName: sensorNameOf(d) }))
+    sensorNames = new Map(sensorListOf(allData).map(s => [s.sensorID, s.name]))
   } catch (err) {
     console.error("logs unavailable:", err.message)
     return
   }
 
-  if (!sensorsCreated) {
-    createSensorCheckboxes()
-    buildCharts()
-    sensorsCreated = true
+  const sensors = sensorListOf(allData)
+  const key = sensors.map(s => s.sensorID).join(",")
+
+  // Only when the SET changes - rebuilding this on every poll would fight the
+  // user for the checkbox they are in the middle of clicking.
+  if (key !== sensorKey) {
+    sensorKey = key
+    createSensorCheckboxes(sensors)
   }
+
+  if (!charts.tempChart) buildCharts()
 
   updateCharts()
 }
@@ -48,23 +67,12 @@ async function loadData() {
 // =====================
 // Create sensor toggles
 // =====================
-function createSensorCheckboxes() {
-  const sensors = [...new Set(allData.map(d => d.sensorName))]
-  const container = document.getElementById("checkboxes")
-
-  container.innerHTML = ""
-
-  sensors.forEach(name => {
-    const label = document.createElement("label")
-
-    label.innerHTML = `
-      <input type="checkbox" checked value="${name}">
-      ${name}
-    `
-
-    label.onchange = updateCharts
-    container.appendChild(label)
-  })
+function createSensorCheckboxes(sensors) {
+  renderSensorCheckboxes(
+    document.getElementById("checkboxes"),
+    sensors,
+    updateCharts
+  )
 }
 
 
@@ -112,13 +120,27 @@ function updateCharts() {
     const chart = charts[series.canvas]
     if (!chart) return
 
-    chart.data.datasets = selectedSensors.map(sensor => ({
-      label: sensor,
-      data: allData
-        .filter(d => d.sensorName === sensor && d[series.field] !== null)
-        .map(d => ({ x: new Date(d.datetime), y: d[series.field] })),
-      fill: false
-    }))
+    chart.data.datasets = selectedSensors.map(sensorID => {
+      // The colour comes from the ID, so it is the same on all three panels -
+      // sensor 3's temperature, humidity and VPD all draw green. It is the
+      // sensor that identifies a line; the y-axis already says which metric
+      // the panel shows. Do NOT vary it by metric.
+      const color = sensorColor(sensorID)
+
+      return {
+        label: sensorNames.get(sensorID) || `sensor ${sensorID}`,
+        data: allData
+          .filter(d => Number(d.sensorID) === sensorID && d[series.field] !== null)
+          .map(d => ({ x: new Date(d.datetime), y: d[series.field] })),
+        // Both, not just borderColor: Chart.js fills the points from its own
+        // default cycle otherwise. Setting both also makes the built-in legend
+        // swatch right for free.
+        borderColor: color,
+        backgroundColor: color,
+        pointBackgroundColor: color,
+        fill: false
+      }
+    })
 
     chart.update()
   })
@@ -127,6 +149,25 @@ function updateCharts() {
 
 // =====================
 // Start
+//
+// The config call comes first: renderTimeControls() reads maxLogHours from it
+// to decide which presets it can offer, and startPolling() reads the window to
+// decide how often to reload. loadServerConfig() falls back to the built-in
+// defaults on its own if the call fails, so this cannot leave the page blank.
 // =====================
-loadData()
-setInterval(loadData, 2500)
+async function start() {
+  await loadServerConfig()
+
+  renderTimeControls(
+    document.getElementById("timeControls"),
+    () => {
+      // The sensor set is window-dependent, so a new range rebuilds the list.
+      sensorKey = null
+      startPolling(loadData)
+    }
+  )
+
+  startPolling(loadData)
+}
+
+start()

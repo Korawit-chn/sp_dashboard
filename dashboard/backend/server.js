@@ -21,6 +21,8 @@ const {
   MAX_SEND_SECONDS,
   OFFLINE_AFTER_MS,
   MAX_MIST_SECONDS,
+  MAX_LOG_HOURS,
+  DEFAULT_LOG_HOURS,
   MAX_FAN_SECONDS
 } = require('./config');
 const { logDeviceEvent, runOfflineWatchdog } = require('./deviceState');
@@ -99,6 +101,12 @@ app.get('/api/config', (req, res) => {
     offlineAfterSeconds: Math.round(OFFLINE_AFTER_MS / 1000),
     maxMistSeconds: MAX_MIST_SECONDS,
     maxFanSeconds: MAX_FAN_SECONDS,
+    // The log window the dashboard's time picker is allowed to ask for. It is
+    // enforced in routes/sensors.js either way - a range past the ceiling gets
+    // a 400 - but the picker needs the number to stop offering ranges the
+    // server will refuse, and carrying its own copy of it is how the two drift.
+    maxLogHours: MAX_LOG_HOURS,
+    defaultLogHours: DEFAULT_LOG_HOURS,
     serverEpochMs: Date.now()
   });
 });

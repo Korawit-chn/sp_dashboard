@@ -32,3 +32,21 @@ th, td {
 th {
   background: #f2f2f2;
 }
+
+/* The sensor colour itself is set inline from sensorColor() - see
+   js/sensorColors.js. No hex values here, or the palette would live in two
+   places and drift. */
+.sensor-swatch {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin: 0 5px 0 3px;
+  border: 1px solid #0003;
+  border-radius: 2px;
+  vertical-align: -1px;
+}
+
+#checkboxes label {
+  margin-right: 14px;
+  white-space: nowrap;
+}
