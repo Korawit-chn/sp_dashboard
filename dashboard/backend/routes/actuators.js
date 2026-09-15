@@ -3,9 +3,10 @@
 //
 // Same pull model as /api/schedule: the Pi cannot be pushed to, so a "command"
 // is just the latest MANUAL/AUTOMATION row in ActuatorLog. The Pi polls for it.
-// Periodic telemetry (rpm/pulseCount/dutyPercent) is written as its own
-// ActuatorLog row with triggerSource='SYSTEM' so it never gets picked up as
-// a command, plus a matching ActuatorStatus row for health/heartbeat.
+// The Pi reports back through POST /api/actuatorState: the real ON/OFF goes to
+// Actuator.status, and periodic telemetry (rpm/pulseCount/dutyPercent) is
+// written as its own ActuatorLog row with triggerSource='SYSTEM' so it never
+// gets picked up as a command.
 //
 // Was the fenced "v2.2.1af" block in server.js.
 // ===========================================================================
@@ -209,8 +210,24 @@ router.get('/actuatorCommand', asyncRoute(async (req, res) => {
 
 }));
 
-// Pi pushes back telemetry (duty applied, pulses counted, derived rpm)
-router.post('/actuatorStatus', asyncRoute(async (req, res) => {
+// Every actuator reports back here: what the hardware is actually doing, plus
+// feedback readings if it has any.
+//
+//   mist relay: { actuatorID, state }
+//   fan:        { actuatorID, state, pwmDutyPercent, pulseCount, rpm }
+//
+// This used to be two endpoints, and the split was the cause of a bug: the
+// fan's endpoint only logged telemetry, so its Actuator.status was only ever
+// the optimistic write from POST /api/actuatorCommand. A timed fan run ended on
+// the Pi and the dashboard went on saying ON until somebody sent another
+// command.
+//
+// The split existed because the fan's endpoint wrote a SET_SPEED log row on
+// every call, which would have buried a relay's ON/OFF history under heartbeat
+// noise. The log row is now written only when there are readings to put in it,
+// so a relay still adds nothing to ActuatorLog, which stays a record of
+// commands plus the fan's feedback.
+async function reportActuator(req, res) {
   const actuatorID = toInt(req.body.actuatorID);
   const pwmDutyPercent = toFloat(req.body.pwmDutyPercent);
   const pulseCount = toInt(req.body.pulseCount);
@@ -220,35 +237,15 @@ router.post('/actuatorStatus', asyncRoute(async (req, res) => {
   // property of the Pi's one radio rather than of each actuator on it. Older
   // fan clients keep sending them; there is no reason to 400 for that.
 
-  if (actuatorID == null) {
-    return res.status(400).json({ success: false, message: 'actuatorID is required' });
+  const hasTelemetry = pwmDutyPercent != null || pulseCount != null || rpm != null;
+
+  // A fan client from before the merge sends duty but no state. The duty it
+  // applied is exactly what state means for a fan, so derive it rather than
+  // reject a Pi nobody has updated yet.
+  let state = req.body.state;
+  if (state == null && pwmDutyPercent != null) {
+    state = pwmDutyPercent > 0 ? 'ON' : 'OFF';
   }
-
-  // Telemetry goes to ActuatorLog and nowhere else. This used to write the same
-  // duty to ActuatorStatus in the same request, which is what made that table a
-  // duplicate of the log. Liveness is the device agent's job now.
-  //
-  // Feedback reading, kept separate from real commands via triggerSource='SYSTEM'
-  await pool.execute(
-    `INSERT INTO ActuatorLog (actuatorID, action, pwmDutyPercent, pulseCount, rpm, triggerSource)
-     VALUES (?, 'SET_SPEED', ?, ?, ?, 'SYSTEM')`,
-    [actuatorID, pwmDutyPercent, pulseCount, rpm]
-  );
-
-  res.status(200).json({ success: true });
-
-}));
-
-// Simple actuators (mist maker relay) report state + heartbeat here.
-//
-// Separate from /api/actuatorStatus because that one hardcodes a SET_SPEED
-// ActuatorLog row on every call. That is right for a fan, where duty/rpm/pulse
-// feedback IS the telemetry, and wrong for a relay that has none: within a day
-// the real ON/OFF history would be buried under heartbeat noise. So this
-// writes no log row at all, and ActuatorLog stays a record of commands.
-router.post('/actuatorState', asyncRoute(async (req, res) => {
-  const actuatorID = toInt(req.body.actuatorID);
-  const state = req.body.state;
 
   if (actuatorID == null || !ACTUATOR_STATES.includes(state)) {
     return res.status(400).json({
@@ -260,9 +257,9 @@ router.post('/actuatorState', asyncRoute(async (req, res) => {
   // Unlike the optimistic write in POST /api/actuatorCommand, this is the
   // device telling us what the hardware is actually doing.
   //
-  // It is NOT a heartbeat any more. relay_control.py used to call this every
-  // 60 s purely to stamp lastHeartbeat; the device agent reports liveness now,
-  // so this fires only when the state actually changes.
+  // It is NOT a heartbeat - the device agent reports liveness, once per Pi. So
+  // statusUpdatedAt means "last reported": the relay reports only when its
+  // state changes, the fan on every telemetry report as well.
   const [result] = await pool.execute(
     'UPDATE Actuator SET status = ?, statusUpdatedAt = NOW(6) WHERE actuatorID = ?',
     [state, actuatorID]
@@ -277,6 +274,9 @@ router.post('/actuatorState', asyncRoute(async (req, res) => {
   // statusUpdatedAt = NOW(6) changes on every call: mysql2 reports rows
   // actually CHANGED, so a matching row whose state was already correct would
   // otherwise report 0 and produce a false 404.
+  //
+  // Checked before the log insert, so a stale actuatorID gets this 404 rather
+  // than a foreign-key 500.
   if (result.affectedRows === 0) {
     return res.status(404).json({
       success: false,
@@ -284,9 +284,24 @@ router.post('/actuatorState', asyncRoute(async (req, res) => {
     });
   }
 
-  res.status(200).json({ success: true, serverEpochMs: Date.now() });
+  // Feedback reading, kept separate from real commands via triggerSource='SYSTEM'
+  if (hasTelemetry) {
+    await pool.execute(
+      `INSERT INTO ActuatorLog (actuatorID, action, pwmDutyPercent, pulseCount, rpm, triggerSource)
+       VALUES (?, 'SET_SPEED', ?, ?, ?, 'SYSTEM')`,
+      [actuatorID, pwmDutyPercent, pulseCount, rpm]
+    );
+  }
 
-}));
+  res.status(200).json({ success: true, serverEpochMs: Date.now() });
+}
+
+router.post('/actuatorState', asyncRoute(reportActuator));
+
+// The old fan endpoint, kept so a fan Pi that has not been updated keeps
+// working - reportActuator derives its state from the duty. Remove once every
+// fan runs a fan_control.py that posts to /api/actuatorState.
+router.post('/actuatorStatus', asyncRoute(reportActuator));
 
 // List actuators + latest known status, like /api/devices
 router.get('/actuators', asyncRoute(async (req, res) => {
