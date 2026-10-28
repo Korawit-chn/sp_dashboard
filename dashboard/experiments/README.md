@@ -2,7 +2,9 @@
 
 `fan_mist_experiment.py` steps the dome fan through PWM 5%, 10%, ... 100%.
 Before each step it mists the dome until humidity (sensorID 1) reaches 100%,
-then runs the fan for 30 s and records the time the fan started.
+then runs the fan for 30 s and records the time the fan started. After each
+run it pauses 60 s with the mist and fan off, so the humidity log shows how the
+box settles before the next misting.
 
 It runs on the **Windows PC that runs the dashboard backend** and controls the
 mist and fan through the dashboard API at `http://localhost:5000`. Nothing is
@@ -47,6 +49,8 @@ Each round prints what it is doing:
 [2026-10-27 15:58:55] fan SET_SPEED 5% for 30s - waiting for the Pi
 [2026-10-27 15:58:59] fan confirmed at 5%
 [2026-10-27 15:58:59] recorded 5%: 2026-10-27 15:58:59
+[2026-10-27 15:59:31] fan stopped
+[2026-10-27 15:59:31] pause 60s - mist and fan off
 ```
 
 ## Results and progress
@@ -82,6 +86,7 @@ constants at the top of `fan_mist_experiment.py`:
 | `TARGET_HUMIDITY` | `100.0` | Humidity to reach before each fan run. A DHT22 often tops out at 99.x - set `99` if it never reaches 100. |
 | `PWM_START` / `PWM_STEP` | `5` / `5` | First PWM and the increase per round |
 | `FAN_SECONDS` | `30` | How long the fan runs each round |
+| `PAUSE_SECONDS` | `60` | Pause after each run, mist and fan off, before the next misting |
 | `SENSOR_ID` | `1` | Sensor whose humidity is used |
 | `LOCATION`, `FAN_TYPE`, `MIST_TYPE` | `Inside Box 1`, `FAN`, `Mist Maker` | How the fan and mister are found in the dashboard - the `Location:` and `Type:` the actuator Pis register with (case does not matter) |
 

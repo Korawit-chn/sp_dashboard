@@ -14,6 +14,8 @@ One round, repeated until the fan has run at 100%:
     4. record the moment the fan Pi confirms it is running, and move the
        current PWM up by PWM_STEP
     5. wait for the run to finish
+    6. pause PAUSE_SECONDS with the mist and fan both off, so the log shows
+       how humidity settles after the run before the next misting
 
 Everything goes through the dashboard API - the same calls the dashboard's own
 buttons make - so the Pis stay in charge of the hardware and every command
@@ -77,6 +79,8 @@ TARGET_HUMIDITY = 100.0     # a DHT22 often tops out at 99.x - lower this if so
 PWM_START = 5
 PWM_STEP = 5
 FAN_SECONDS = 30
+# After every run, the last one included, before the next misting starts.
+PAUSE_SECONDS = 60
 
 # --- Which devices ---
 SENSOR_ID = 1
@@ -397,6 +401,9 @@ def main():
             log(f"recorded {_fmt(pwm)}%: {text}")
 
             wait_fan_done(api, fan_id, started)
+
+            log(f"pause {PAUSE_SECONDS:g}s - mist and fan off")
+            time.sleep(PAUSE_SECONDS)
 
         log("experiment complete")
         return 0
