@@ -81,7 +81,7 @@ constants at the top of `fan_mist_experiment.py`:
 | `PWM_START` / `PWM_STEP` | `5` / `5` | First PWM and the increase per round |
 | `FAN_SECONDS` | `30` | How long the fan runs each round |
 | `SENSOR_ID` | `1` | Sensor whose humidity is used |
-| `LOCATION`, `FAN_TYPE`, `MIST_TYPE` | `Inside Box`, `FAN`, `Mist Maker` | How the fan and mister are found in the dashboard - the `Location:` and `Type:` the actuator Pis register with (case does not matter) |
+| `LOCATION`, `FAN_TYPE`, `MIST_TYPE` | `Inside Box 1`, `FAN`, `Mist Maker` | How the fan and mister are found in the dashboard - the `Location:` and `Type:` the actuator Pis register with (case does not matter) |
 
 ## If something goes wrong
 
@@ -89,7 +89,7 @@ constants at the top of `fan_mist_experiment.py`:
   or ran for a different Python. Run `python -m pip install requests` again.
 - **Connection refused / backend error** - the backend is not running on this
   PC, or not on port 5000.
-- **`expected one 'FAN' actuator at 'Inside Box', found 0`** - the fan or
+- **`expected one 'FAN' actuator at 'Inside Box 1', found 0`** - the fan or
   mist Pi has never registered with this backend, or registered with a
   different `Location:`. Check it appears on the dashboard, and that
   `LOCATION` matches its location there.
