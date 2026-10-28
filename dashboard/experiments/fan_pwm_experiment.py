@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""fan_mist_experiment.py - step the fan through PWM 5%..100% against a saturated dome.
+"""fan_pwm_experiment.py - step the fan through PWM 5%..100% against a saturated box.
 
-    python fan_mist_experiment.py
+    python fan_pwm_experiment.py
 
 Runs on the backend's own machine, so it talks to localhost. There are no
 arguments - everything about the experiment is a constant below.
 
-One round, repeated until the fan has run at 100%:
+The whole set of rounds, 5% to 100%, is done REPEATS times, in order. One round:
 
     1. mist ON, wait until sensorID 1 reads >= TARGET_HUMIDITY
     2. mist OFF
     3. fan SET_SPEED at the current PWM, for FAN_SECONDS
     4. record the moment the fan Pi confirms it is running, and move the
-       current PWM up by PWM_STEP
+       current PWM up by PWM_STEP - past 100% it goes back to PWM_START in
+       the next repeat
     5. wait for the run to finish
     6. pause PAUSE_SECONDS with the mist and fan both off, so the log shows
        how humidity settles after the run before the next misting
@@ -26,15 +27,20 @@ THE PROGRESS FILE
 One .txt next to this script, created on the first run, is both the result and
 the resume point:
 
-    current PWM: 15% (start 5%)
+    current repeat: 2 of 3
+    current PWM: 10% (start 5%)
     Time Record
-    5%: 2026-10-27 15:58:59
-    10%: 2026-10-27 16:04:12
+    Repeat 1
+    5%: 2026-10-29 09:00:12
+    ...
+    100%: 2026-10-29 10:41:55
+    Repeat 2
+    5%: 2026-10-29 10:43:30
 
-"current PWM" moves up the moment a time is recorded, so stopping the script
-and starting it again carries on from that line. After 100% is recorded it
-reads "current PWM: complete" and a further run does nothing. Delete or rename
-the file to start a new experiment.
+"current repeat" and "current PWM" move on the moment a time is recorded, so
+stopping the script and starting it again carries on from those lines. After
+100% is recorded in the last repeat both read "complete" and a further run does
+nothing. Delete or rename the file to start a new experiment.
 
 WHICH TIME IS RECORDED
 
@@ -72,7 +78,7 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 
 BACKEND = "http://localhost:5000"
-PROGRESS_FILE = BASE_DIR / "fan_experiment.txt"
+PROGRESS_FILE = BASE_DIR / "fan_pwm_experiment.txt"
 
 # --- The experiment ---
 TARGET_HUMIDITY = 100.0     # a DHT22 often tops out at 99.x - lower this if so
@@ -81,6 +87,8 @@ PWM_STEP = 5
 FAN_SECONDS = 30
 # After every run, the last one included, before the next misting starts.
 PAUSE_SECONDS = 60
+# How many times the whole 5%..100% set is done, in order.
+REPEATS = 3
 
 # --- Which devices ---
 SENSOR_ID = 1
@@ -124,23 +132,40 @@ def log(message):
 # ---------------------------------------------------------------------------
 
 class Progress:
-    """The .txt file: the current PWM and one recorded time per PWM."""
+    """The .txt file: where the experiment is, and one time per PWM per repeat."""
 
     def __init__(self, path):
         self.path = Path(path)
         self.start = PWM_START
-        self.current = PWM_START      # None once 100% has been recorded
-        self.records = []             # [(pwm, text)]
+        self.repeat = 1               # None, with current, once all are done
+        self.current = PWM_START
+        self.records = {}             # {repeat: [(pwm, text)]}
+
+    @property
+    def complete(self):
+        return self.current is None
 
     def load(self):
-        """Read an existing file, or leave the defaults for a fresh run."""
+        """Read an existing file, or leave the defaults for a fresh run.
+
+        Times above any "Repeat" heading count as repeat 1, so a file written
+        before repeats existed still reads.
+        """
         if not self.path.exists():
             return
 
+        section = 1
+
         for line in self.path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
+            lower = line.lower()
 
-            if line.lower().startswith("current pwm:"):
+            if lower.startswith("current repeat:"):
+                value = line.split(":", 1)[1].strip()
+                # "2 of 3", or "complete (3 repeats)" once every repeat is done.
+                self.repeat = None if value.startswith("complete") else int(value.split()[0])
+
+            elif lower.startswith("current pwm:"):
                 rest = line.split(":", 1)[1].strip()
                 current, _, start = rest.partition("(start")
                 current = current.strip()
@@ -149,27 +174,56 @@ class Progress:
                 if start:
                     self.start = _percent(start.rstrip(")").strip())
 
+            elif lower.startswith("repeat "):
+                section = int(line.split()[1])
+
             elif "%:" in line:
                 pwm, text = line.split("%:", 1)
-                self.records.append((_percent(pwm), text.strip()))
+                self.records.setdefault(section, []).append((_percent(pwm), text.strip()))
 
-        if self.current is None and not self.records:
+        if self.current is None:
+            self.repeat = None
+
+        if self.complete and not self.records:
             raise SystemExit(f"{self.path}: says complete but has no records")
 
     def record(self, pwm, text):
-        """Write one time and move current up - in one write, so a crash
-        cannot leave a recorded PWM that is still marked current."""
-        self.records = [r for r in self.records if r[0] != pwm]
-        self.records.append((pwm, text))
+        """Write one time and move on - in one write, so a crash cannot leave
+        a recorded PWM that is still marked current.
+
+        Past 100% the next repeat starts again from the first PWM; past the
+        last repeat the experiment is complete.
+        """
+        rows = [r for r in self.records.get(self.repeat, []) if r[0] != pwm]
+        rows.append((pwm, text))
+        self.records[self.repeat] = rows
 
         nxt = pwm + PWM_STEP
-        self.current = nxt if nxt <= 100 else None
+
+        if nxt <= 100:
+            self.current = nxt
+        elif self.repeat < REPEATS:
+            self.repeat += 1
+            self.current = self.start
+        else:
+            self.repeat = None
+            self.current = None
+
         self.save()
 
     def save(self):
-        current = "complete" if self.current is None else f"{_fmt(self.current)}%"
-        lines = [f"current PWM: {current} (start {_fmt(self.start)}%)", "Time Record"]
-        lines += [f"{_fmt(pwm)}%: {text}" for pwm, text in self.records]
+        if self.complete:
+            lines = [f"current repeat: complete ({REPEATS} repeats)",
+                     f"current PWM: complete (start {_fmt(self.start)}%)"]
+        else:
+            lines = [f"current repeat: {self.repeat} of {REPEATS}",
+                     f"current PWM: {_fmt(self.current)}% (start {_fmt(self.start)}%)"]
+
+        lines.append("Time Record")
+
+        for repeat in sorted(self.records):
+            lines.append(f"Repeat {repeat}")
+            lines += [f"{_fmt(pwm)}%: {text}" for pwm, text in self.records[repeat]]
 
         # Atomic, same as the Pis' state files: a half-written progress file
         # would resume from the wrong PWM.
@@ -380,25 +434,26 @@ def main():
         log(f"mist and fan OFF at startup - waiting {STARTUP_OFF_SECONDS}s for the Pis")
         time.sleep(STARTUP_OFF_SECONDS)
 
-        if progress.current is None:
+        if progress.complete:
             log(f"{progress.path} is already complete - nothing to do")
             return 0
 
         progress.save()
         log(f"progress: {progress.path}")
-        log(f"starting at {_fmt(progress.current)}% (start {_fmt(progress.start)}%, "
+        log(f"starting at repeat {progress.repeat} of {REPEATS}, "
+            f"{_fmt(progress.current)}% (start {_fmt(progress.start)}%, "
             f"step {_fmt(PWM_STEP)}%)")
 
-        while progress.current is not None:
-            pwm = progress.current
-            log(f"=== round {_fmt(pwm)}% ===")
+        while not progress.complete:
+            repeat, pwm = progress.repeat, progress.current
+            log(f"=== repeat {repeat} of {REPEATS}, round {_fmt(pwm)}% ===")
 
             saturate(api, mist_id)
 
             started = time.monotonic()
             text = run_fan(api, fan_id, pwm)
             progress.record(pwm, text)
-            log(f"recorded {_fmt(pwm)}%: {text}")
+            log(f"recorded repeat {repeat}, {_fmt(pwm)}%: {text}")
 
             wait_fan_done(api, fan_id, started)
 
