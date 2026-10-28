@@ -75,7 +75,7 @@ FAN_SECONDS = 30
 
 # --- Which devices ---
 SENSOR_ID = 1
-LOCATION = "Inside Dome 1"
+LOCATION = "Inside Box"     # Location: of the fan and mist Pis, not the sensor's
 FAN_TYPE = "FAN"            # Type: in config_fan.txt
 MIST_TYPE = "Mist Maker"    # Type: in config.txt
 
