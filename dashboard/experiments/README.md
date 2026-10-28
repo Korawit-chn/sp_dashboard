@@ -63,6 +63,8 @@ Time Record
   command was sent. `(unconfirmed)` after a time means the Pi did not report
   within 30 s and the send time was used instead.
 - `current PWM` moves up as soon as a time is recorded.
+- Every start first turns the mist and fan off and waits 10 s, so a run
+  never begins with the mist left on from last time.
 - Misting has no time limit - it keeps going until humidity reaches the
   target. If it never gets there, press Ctrl-C.
 - **Ctrl-C** stops the experiment and turns the mist and fan off. Run the

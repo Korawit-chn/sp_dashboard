@@ -47,8 +47,13 @@ SAFETY
 The fan is always sent with a duration, so the fan Pi stops it on its own
 even if this script dies mid-run. The mist is sent with the backend's longest
 duration and re-sent while waiting, which only pushes the mist Pi's deadline
-out - its relay is already ON, so nothing is pulsed. Ctrl-C, or any error,
-sends OFF to both before exiting.
+out - its relay is already ON, so nothing is pulsed. Every start sends OFF to
+both before anything else, and Ctrl-C, or any error, sends OFF to both before
+exiting.
+
+An OFF only reaches the hardware if the mist Pi believes the relay is ON. A
+relay that drifted - believed OFF, actually misting - needs
+`mist_relay_control.py flip` on the Pi; no API call can see or fix that.
 
 Humidity comes from GET /api/logs, which is only as fresh as the sensor's last
 upload (sendSeconds in the dashboard's schedule, 60 s by default). A short
@@ -85,6 +90,9 @@ REQUEST_TIMEOUT = 5
 # anyway, so re-sending well inside it keeps the mister running without a gap.
 MIST_RUN_SECONDS = 600
 MIST_RESEND_SECONDS = 300
+
+# Both Pis poll for commands every 5 s, so 10 s covers a full poll on each.
+STARTUP_OFF_SECONDS = 10
 
 HUMIDITY_POLL_SECONDS = 10
 # Faster than the humidity poll on purpose, and only for the few seconds after
@@ -356,20 +364,27 @@ def main():
     progress = Progress(PROGRESS_FILE)
     progress.load()
 
-    if progress.current is None:
-        log(f"{progress.path} is already complete - nothing to do")
-        return 0
-
-    progress.save()
-    log(f"progress: {progress.path}")
-    log(f"starting at {_fmt(progress.current)}% (start {_fmt(progress.start)}%, "
-        f"step {_fmt(PWM_STEP)}%)")
-
     fan_id = api.find_actuator(FAN_TYPE)
     mist_id = api.find_actuator(MIST_TYPE)
     log(f"fan actuatorID {fan_id}, mist actuatorID {mist_id}, sensorID {SENSOR_ID}")
 
     try:
+        # Whatever the last run left behind - a crash, a killed window - both
+        # start this one OFF, even when there is nothing left to do. The wait
+        # gives each Pi one poll to pick the OFF up before round 1 sends ON.
+        stop_all(api, (mist_id, fan_id))
+        log(f"mist and fan OFF at startup - waiting {STARTUP_OFF_SECONDS}s for the Pis")
+        time.sleep(STARTUP_OFF_SECONDS)
+
+        if progress.current is None:
+            log(f"{progress.path} is already complete - nothing to do")
+            return 0
+
+        progress.save()
+        log(f"progress: {progress.path}")
+        log(f"starting at {_fmt(progress.current)}% (start {_fmt(progress.start)}%, "
+            f"step {_fmt(PWM_STEP)}%)")
+
         while progress.current is not None:
             pwm = progress.current
             log(f"=== round {_fmt(pwm)}% ===")
