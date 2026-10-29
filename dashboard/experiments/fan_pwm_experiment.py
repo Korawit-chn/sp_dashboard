@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""fan_pwm_experiment.py - step the fan through PWM 5%..100% against a saturated box.
+"""fan_pwm_experiment.py - step the fan through PWM 10%..100% against a saturated box.
 
     python fan_pwm_experiment.py
 
 Runs on the backend's own machine, so it talks to localhost. There are no
 arguments - everything about the experiment is a constant below.
 
-The whole set of rounds, 5% to 100%, is done REPEATS times, in order. One round:
+The whole set of rounds, 10%, 25% ... 100%, is done REPEATS times, in order.
+One round:
 
-    1. mist ON, wait until sensorID 1 reads >= TARGET_HUMIDITY
-    2. mist OFF
+    1. wait for a sensorID 1 reading taken since the last run ended
+    2. if it is already >= TARGET_HUMIDITY, skip straight to the fan;
+       otherwise mist ON until a reading is >= TARGET_HUMIDITY, mist OFF,
+       and wait MIST_SETTLE_SECONDS
     3. fan SET_SPEED at the current PWM, for FAN_SECONDS
     4. record the moment the fan Pi confirms it is running, and move the
        current PWM up by PWM_STEP - past 100% it goes back to PWM_START in
        the next repeat
     5. wait for the run to finish
     6. pause PAUSE_SECONDS with the mist and fan both off, so the log shows
-       how humidity settles after the run before the next misting
+       how humidity settles after the run before the next round
 
 Everything goes through the dashboard API - the same calls the dashboard's own
 buttons make - so the Pis stay in charge of the hardware and every command
@@ -82,9 +85,12 @@ PROGRESS_FILE = BASE_DIR / "fan_pwm_experiment.txt"
 
 # --- The experiment ---
 TARGET_HUMIDITY = 100.0     # a DHT22 often tops out at 99.x - lower this if so
-PWM_START = 5
-PWM_STEP = 5
+PWM_START = 10
+PWM_STEP = 15               # 10, 25, 40, 55, 70, 85, 100
 FAN_SECONDS = 30
+# After the mist stops, before the fan starts. Not used when the box is
+# already at the target and the mist is skipped.
+MIST_SETTLE_SECONDS = 20
 # After every run, the last one included, before the next misting starts.
 PAUSE_SECONDS = 60
 # How many times the whole 5%..100% set is done, in order.
@@ -118,7 +124,9 @@ CONFIRM_TIMEOUT_SECONDS = 30
 
 # How far back /api/logs is asked to look. Wide enough to cover one upload
 # interval of a slow sensor, small enough to stay cheap at a 10 s poll.
-LOG_WINDOW_HOURS = 0.25
+# Whole hours only: MySQL rounds INTERVAL 0.25 HOUR to 0, so a fractional
+# window returns no rows and the mist never stops.
+LOG_WINDOW_HOURS = 1
 
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -186,6 +194,15 @@ class Progress:
 
         if self.complete and not self.records:
             raise SystemExit(f"{self.path}: says complete but has no records")
+
+        # A file from before PWM_START / PWM_STEP changed would resume off the
+        # new 10, 25, 40 ... sequence and mix two experiments in one file.
+        if self.start != PWM_START or (
+                not self.complete and (self.current - self.start) % PWM_STEP):
+            raise SystemExit(
+                f"{self.path} was written with different PWM settings "
+                f"(start {_fmt(self.start)}%) - rename or delete it to start "
+                f"the {_fmt(PWM_START)}% / +{_fmt(PWM_STEP)}% experiment")
 
     def record(self, pwm, text):
         """Write one time and move on - in one write, so a crash cannot leave
@@ -309,25 +326,50 @@ class Api:
 # One round
 # ---------------------------------------------------------------------------
 
-def saturate(api, mist_id):
-    """Mist until the sensor reads >= target, then stop the mist.
+def newest_reading_time(api):
+    reading = api.latest_humidity()
+    return reading[0] if reading else None
 
-    There is no time limit: it mists for as long as the target takes, and
-    Ctrl-C is how to stop a round that never gets there.
 
-    Only a reading newer than the newest one at the moment the mist started
-    counts, so humidity left over from the last round cannot end this one
-    before any misting has happened.
+def wait_new_reading(api, baseline):
+    """Wait for a sensor reading newer than baseline, and return it."""
+    reading = api.latest_humidity()
+
+    if not (reading and (baseline is None or reading[0] > baseline)):
+        log("waiting for a new humidity reading")
+
+    while not (reading and (baseline is None or reading[0] > baseline)):
+        time.sleep(HUMIDITY_POLL_SECONDS)
+        reading = api.latest_humidity()
+
+    return reading
+
+
+def saturate(api, mist_id, baseline):
+    """Get the box to the target before the fan runs.
+
+    The first reading newer than baseline decides. If it is already at the
+    target the mist is skipped. Otherwise it mists until a reading reaches
+    the target, stops the mist, and waits MIST_SETTLE_SECONDS.
+
+    baseline is the newest reading's time when the last run ended, so a
+    reading from before that run - humidity the fan has since lowered -
+    cannot count as "already at the target".
+
+    There is no time limit on misting: it mists for as long as the target
+    takes, and Ctrl-C is how to stop a round that never gets there.
     """
-    before = api.latest_humidity()
-    baseline = before[0] if before else None
+    reading = wait_new_reading(api, baseline)
 
-    log(f"mist ON - waiting for humidity >= {TARGET_HUMIDITY:g}%"
-        + (f" (now {before[1]:.1f}%)" if before else ""))
+    if reading[1] >= TARGET_HUMIDITY:
+        log(f"humidity {reading[1]:.1f}% - already at {TARGET_HUMIDITY:g}%, no mist")
+        return
+
+    log(f"humidity {reading[1]:.1f}% - mist ON until >= {TARGET_HUMIDITY:g}%")
 
     started = time.monotonic()
     last_send = None
-    last_shown = None
+    last_shown = reading[0]
 
     while True:
         now = time.monotonic()
@@ -336,19 +378,21 @@ def saturate(api, mist_id):
             api.command(mist_id, "ON", seconds=MIST_RUN_SECONDS)
             last_send = now
 
+        time.sleep(HUMIDITY_POLL_SECONDS)
         reading = api.latest_humidity()
 
-        if reading and reading[0] != last_shown and (baseline is None or reading[0] > baseline):
+        # Only readings taken after the one that started the mist count.
+        if reading and reading[0] > last_shown:
             last_shown = reading[0]
             log(f"humidity {reading[1]:.1f}%")
 
             if reading[1] >= TARGET_HUMIDITY:
                 break
 
-        time.sleep(HUMIDITY_POLL_SECONDS)
-
     api.command(mist_id, "OFF")
-    log(f"mist OFF after {time.monotonic() - started:.0f}s")
+    log(f"mist OFF after {time.monotonic() - started:.0f}s - "
+        f"waiting {MIST_SETTLE_SECONDS:g}s before the fan")
+    time.sleep(MIST_SETTLE_SECONDS)
 
 
 def run_fan(api, fan_id, pwm):
@@ -444,11 +488,15 @@ def main():
             f"{_fmt(progress.current)}% (start {_fmt(progress.start)}%, "
             f"step {_fmt(PWM_STEP)}%)")
 
+        # Round 1 decides on a reading taken after startup, never one left
+        # over from before it.
+        baseline = newest_reading_time(api)
+
         while not progress.complete:
             repeat, pwm = progress.repeat, progress.current
             log(f"=== repeat {repeat} of {REPEATS}, round {_fmt(pwm)}% ===")
 
-            saturate(api, mist_id)
+            saturate(api, mist_id, baseline)
 
             started = time.monotonic()
             text = run_fan(api, fan_id, pwm)
@@ -456,6 +504,7 @@ def main():
             log(f"recorded repeat {repeat}, {_fmt(pwm)}%: {text}")
 
             wait_fan_done(api, fan_id, started)
+            baseline = newest_reading_time(api)
 
             log(f"pause {PAUSE_SECONDS:g}s - mist and fan off")
             time.sleep(PAUSE_SECONDS)
