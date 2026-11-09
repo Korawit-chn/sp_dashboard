@@ -42,8 +42,9 @@ the resume point:
 
 "current repeat" and "current PWM" move on the moment a time is recorded, so
 stopping the script and starting it again carries on from those lines. After
-100% is recorded in the last repeat both read "complete" and a further run does
-nothing. Delete or rename the file to start a new experiment.
+100% is recorded in the last repeat both read "complete", the file ends with an
+"experiment end" line (what experiment_manager.py looks for), and a further run
+does nothing. Delete or rename the file to start a new experiment.
 
 WHICH TIME IS RECORDED
 
@@ -241,6 +242,11 @@ class Progress:
         for repeat in sorted(self.records):
             lines.append(f"Repeat {repeat}")
             lines += [f"{_fmt(pwm)}%: {text}" for pwm, text in self.records[repeat]]
+
+        # What experiment_manager.py looks for. load() skips it, as it skips
+        # any line it does not recognise.
+        if self.complete:
+            lines.append("experiment end")
 
         # Atomic, same as the Pis' state files: a half-written progress file
         # would resume from the wrong PWM.

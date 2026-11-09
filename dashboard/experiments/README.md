@@ -95,8 +95,9 @@ Repeat 2
   target. If it never gets there, press Ctrl-C.
 - **Ctrl-C** stops the experiment and turns the mist and fan off. Run the
   script again to carry on from `current repeat` and `current PWM`.
-- When 100% is recorded in the last repeat, both lines say `complete`. Delete
-  or rename the file to start a new experiment.
+- When 100% is recorded in the last repeat, both lines say `complete` and the
+  file ends with an `experiment end` line. Delete or rename the file to start
+  a new experiment.
 
 ## Settings
 
@@ -128,3 +129,127 @@ constants at the top of `fan_pwm_experiment.py`:
   hour. Humidity also arrives only as often as the sensor uploads (60 s
   by default), so a shorter send period in the dashboard schedule makes each
   round finish sooner.
+
+# VPD Time and Humidity Time experiments
+
+Two scripts from the **VPD Time** sheet of `experiment plan.xlsx`. They run the
+same way and differ only in what ends a run:
+
+| Script | A run ends when | Writes |
+|---|---|---|
+| `vpd_time_experiment.py` | VPD (sensorID 1) is at or above **0.35 kPa** and stays there for **60 s** | `vpd_time_experiment.txt` |
+| `humidity_time_experiment.py` | the **first** humidity reading (sensorID 1) at or below **80%** | `humidity_time_experiment.txt` |
+
+Each script runs on its own - nothing is shared between them. Setup is the
+same as for the Fan PWM experiment above.
+
+Each script steps the fan through 10%, 25% ... 100% and does that whole set 3
+times. One round:
+
+1. Pause 60 s with the mist and fan off (skipped before the first round of a
+   start), then record **Start**.
+2. Mist until humidity reaches 100%, then mist off. Skipped when the box is
+   already at 100%.
+3. Wait 2 min, start the fan at the round's PWM, and record **Fan on**.
+4. Wait, with no timeout, until the target is reached, and record
+   **Reached**. Then fan off.
+
+```
+python dashboard\experiments\vpd_time_experiment.py
+python dashboard\experiments\humidity_time_experiment.py
+```
+
+## The .txt file
+
+Created next to the script on the first run, with the script's name:
+
+```
+current repeat: 1 of 3
+current PWM: 25% (start 10%)
+Time Record
+Repeat 1
+2026-11-09 12:00:15 Start 10%
+2026-11-09 12:03:40 Fan on 10%
+2026-11-09 12:10:12 Reached VPD 0.35 kPa 10% (6m32s)
+2026-11-09 12:11:12 Start 25%
+```
+
+- **Start** is this PC's time when the round begins, after the pause.
+- **Fan on** is when the fan Pi reported it was running. `(unconfirmed)` means
+  it did not report within 30 s and the send time was used.
+- **Reached** is the sensor reading's own timestamp. For VPD it is the first
+  reading of the 60 s hold that succeeded; a reading that drops back below
+  0.35 kPa restarts the hold. The bracket is the time from Fan on to Reached,
+  and it is only right if the sensor Pi's clock agrees with this PC's.
+- Readings only arrive as often as the sensor uploads (60 s by default), so
+  Reached can be up to one upload late. A shorter send period in the
+  dashboard schedule gives sharper times.
+- **Ctrl-C** turns the mist and fan off. Run the script again to carry on: a
+  round that was stopped part-way is redone, and its old Start / Fan on lines
+  are replaced.
+- When the last round is reached both header lines say `complete` and the
+  file ends with an `experiment end` line. Delete or rename the file to start
+  again.
+- With no timeout the fan is still never left without a deadline. It is sent
+  for 1 hour and re-sent every 30 min while waiting, so if the script dies the
+  fan Pi stops the fan within an hour.
+
+## Settings
+
+Edit the constants at the top of each script: the target (`TARGET_VPD` with
+`HOLD_SECONDS`, or `TARGET_HUMIDITY_DROP`), `PWM_START` / `PWM_STEP`,
+`REPEATS`, `TARGET_HUMIDITY` (what the box is misted to), `MIST_SETTLE_SECONDS`
+(120) and `PAUSE_SECONDS` (60). The devices (`SENSOR_ID`, `LOCATION`,
+`FAN_TYPE`, `MIST_TYPE`) have the same names as in `fan_pwm_experiment.py`.
+
+The three experiment scripts each carry their own copy of the misting, fan and
+progress-file code, so a fix to any of that has to be made in each file.
+
+# Experiment manager
+
+`experiment_manager.py` runs queued experiments one after another, so a whole
+day's set can run without anyone starting each one.
+
+```
+python dashboard\experiments\experiment_manager.py
+```
+
+The first run creates `experiment_queue.txt` next to it, listing the
+experiments in this folder. Add one experiment per line, top to bottom, and
+run the manager again:
+
+```
+vpd_time_experiment
+humidity_time_experiment
+vpd_time_experiment
+```
+
+- **Edit the queue any time.** It is re-read before each experiment starts, so
+  lines added, removed or reordered while one is running take effect when it
+  finishes. Lines starting with `#` are ignored.
+- **An experiment is finished** when it exits normally **and** its .txt ends
+  with `experiment end`. A normal exit without that line counts as a failure
+  (below). Every experiment script must write that line when its last round
+  is done.
+- **Finished lines are rewritten** as a history, and the experiment's .txt is
+  moved into `results/` with the date and time in its name:
+  `done 2026-11-09 14:02:11 vpd_time_experiment -> results/vpd_time_experiment_2026-11-09_140211.txt`.
+  That is what lets the same experiment be queued more than once.
+- A finished .txt left from a run by hand (one ending in `experiment end`, or
+  an older one whose first line says `complete`) is moved into `results/`
+  before the experiment starts. An unfinished one is kept, and the experiment resumes it.
+- A name with no matching script is marked `skipped` and the queue carries on.
+- When the queue is empty the manager exits.
+
+**If an experiment fails** (backend down, actuator missing ...), the manager
+waits 5 min and runs it again, and it resumes from its .txt. After 3 failures
+in a row it stops and leaves the line queued; fix the problem and run the
+manager again.
+
+**Ctrl-C** stops the running experiment, which turns the mist and fan off, and
+then the manager. The line stays queued, so running the manager again resumes
+it. If the experiment has not exited 60 s after Ctrl-C, the manager kills it
+and sends OFF to the mist and fan itself.
+
+Settings, at the top of `experiment_manager.py`: `RETRY_SECONDS` (300),
+`MAX_ATTEMPTS` (3), `CHILD_EXIT_SECONDS` (60).
