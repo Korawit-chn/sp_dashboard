@@ -11,16 +11,17 @@ the experiment is a constant below.
 The whole set of rounds, 10%, 25% ... 100%, is done REPEATS times, in order.
 One round:
 
-    1. pause PAUSE_SECONDS with the mist and fan off (not before the first
-       round of a start), then write "Start"
+    1. write "Start"
     2. wait for a sensorID 1 reading taken since the last run ended; if
        humidity is below TARGET_HUMIDITY, mist ON until a reading reaches it,
        mist OFF. Skipped when the box is already there
     3. wait MIST_SETTLE_SECONDS, then fan SET_SPEED at the round's PWM, and
        write "Fan on" with the time the fan Pi confirms it is running
-    4. wait until VPD (sensorID 1) is at or above TARGET_VPD and stays there
-       for HOLD_SECONDS, write "Reached", move to the next PWM
-    5. fan OFF
+    4. wait for the first VPD reading (sensorID 1) at or above TARGET_VPD,
+       write "Reached", move to the next PWM
+    5. fan OFF straight away
+    6. hold HOLD_SECONDS with the mist and fan off - VPD is not checked during
+       it - then the next round
 
 There is no timeout on step 2 or step 4 - a round waits for as long as it
 takes. Ctrl-C stops the experiment and turns the mist and fan off.
@@ -52,11 +53,9 @@ Start   - this PC's clock, when the round begins.
 Fan on  - the server's timestamp of the fan Pi's first report at the new duty
           (/api/actuators statusUpdatedAtMs). "(unconfirmed)" means the Pi did
           not report within CONFIRM_TIMEOUT_SECONDS and the send time was used.
-Reached - the sensor reading's own timestamp (/api/logs datetime): the FIRST
-          reading of the hold that succeeded, not the end of the hold. A
-          reading below the target restarts the hold. The bracket is Reached
-          minus Fan on, so it is only right when the sensor Pi's clock agrees
-          with this PC's.
+Reached - the timestamp of the first reading at or above the target
+          (/api/logs datetime). The bracket is Reached minus Fan on, so it is
+          only right when the sensor Pi's clock agrees with this PC's.
 
 Readings arrive only as often as the sensor uploads (sendSeconds in the
 dashboard's schedule, 60 s by default), so Reached can be up to one upload
@@ -87,14 +86,13 @@ BACKEND = "http://localhost:5000"
 PROGRESS_FILE = BASE_DIR / "vpd_time_experiment.txt"
 
 # --- The experiment ---
-TARGET_VPD = 0.35           # kPa; reached when VPD is at or above this
-HOLD_SECONDS = 60           # VPD must stay at or above the target this long
+TARGET_VPD = 0.35           # kPa; reached on the first reading at or above this
 PWM_START = 10
 PWM_STEP = 15               # 10, 25, 40, 55, 70, 85, 100
 REPEATS = 3
 TARGET_HUMIDITY = 100.0     # mist to this first; a DHT22 often tops out at 99.x
 MIST_SETTLE_SECONDS = 120   # after the mist stops, before the fan starts
-PAUSE_SECONDS = 60          # after each run, before the next Start
+HOLD_SECONDS = 60           # fan off after Reached, before the next Start (not checked)
 
 # --- Which devices ---
 SENSOR_ID = 1
@@ -451,17 +449,16 @@ def start_fan(api, fan_id, pwm):
 
 
 def wait_vpd(api, fan_id, pwm, baseline):
-    """Watch readings newer than baseline until VPD is at or above TARGET_VPD
-    and stays there for HOLD_SECONDS. Returns the datetime of the first
-    reading of the hold that succeeded.
+    """Watch readings newer than baseline for the first VPD at or above
+    TARGET_VPD, and return its datetime.
 
-    Every new reading is checked, not just the newest, so a dip between two
-    polls still resets the hold. Keeps the fan's deadline ahead meanwhile.
+    Every new reading is checked, not just the newest, so the first one past
+    the target is the one recorded even if several arrive between two polls.
+    Keeps the fan's deadline ahead meanwhile.
     """
-    log(f"waiting for {_vpd(TARGET_VPD)} to hold {HOLD_SECONDS:g}s")
+    log(f"waiting for {_vpd(TARGET_VPD)}")
 
     last_seen = baseline
-    hold_from = None
     last_fan_send = time.monotonic()
 
     while True:
@@ -478,18 +475,8 @@ def wait_vpd(api, fan_id, pwm, baseline):
             log(_vpd(new[-1][1]))
 
         for when, value in new:
-            if value < TARGET_VPD:
-                if hold_from is not None:
-                    log(f"{_vpd(value)} - below the target, hold reset")
-                hold_from = None
-                continue
-
-            if hold_from is None:
-                hold_from = when
-                log(f"{_vpd(value)} - target reached, holding")
-
-            if (when - hold_from).total_seconds() >= HOLD_SECONDS:
-                return hold_from
+            if value >= TARGET_VPD:
+                return when
 
         time.sleep(READING_POLL_SECONDS)
 
@@ -547,17 +534,11 @@ def main():
         log(f"progress: {progress.path}")
         log(f"starting at repeat {progress.repeat} of {REPEATS}, "
             f"{_fmt(progress.current)}% (start {_fmt(progress.start)}%, "
-            f"step {_fmt(PWM_STEP)}%), target {_vpd(TARGET_VPD)} for {HOLD_SECONDS:g}s")
+            f"step {_fmt(PWM_STEP)}%), target {_vpd(TARGET_VPD)}")
 
         baseline = newest_reading_time(api)
-        first = True
 
         while not progress.complete:
-            if not first:
-                log(f"pause {PAUSE_SECONDS:g}s - mist and fan off")
-                time.sleep(PAUSE_SECONDS)
-            first = False
-
             repeat, pwm = progress.repeat, progress.current
             log(f"=== repeat {repeat} of {REPEATS}, round {_fmt(pwm)}% ===")
             log(f"recorded: {progress.begin_round()}")
@@ -579,8 +560,13 @@ def main():
             progress.finish_round(line)
             log(f"recorded: {line}")
 
+            # Fan off as soon as the target is reached, then the hold. The
+            # hold follows every run, the last one too, so the box always gets
+            # it before whatever runs next.
             stop_fan(api, fan_id)
             baseline = newest_reading_time(api)
+            log(f"hold {HOLD_SECONDS:g}s - mist and fan off")
+            time.sleep(HOLD_SECONDS)
 
         log("experiment complete")
         return 0

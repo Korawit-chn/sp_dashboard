@@ -11,8 +11,7 @@ are no arguments - everything about the experiment is a constant below.
 The whole set of rounds, 10%, 25% ... 100%, is done REPEATS times, in order.
 One round:
 
-    1. pause PAUSE_SECONDS with the mist and fan off (not before the first
-       round of a start), then write "Start"
+    1. write "Start"
     2. wait for a sensorID 1 reading taken since the last run ended; if
        humidity is below TARGET_HUMIDITY, mist ON until a reading reaches it,
        mist OFF. Skipped when the box is already there
@@ -20,7 +19,9 @@ One round:
        write "Fan on" with the time the fan Pi confirms it is running
     4. wait for the first humidity reading (sensorID 1) at or below
        TARGET_HUMIDITY_DROP, write "Reached", move to the next PWM
-    5. fan OFF
+    5. fan OFF straight away
+    6. hold HOLD_SECONDS with the mist and fan off - humidity is not checked
+       during it - then the next round
 
 There is no timeout on step 2 or step 4 - a round waits for as long as it
 takes. Ctrl-C stops the experiment and turns the mist and fan off.
@@ -91,7 +92,7 @@ PWM_STEP = 15               # 10, 25, 40, 55, 70, 85, 100
 REPEATS = 3
 TARGET_HUMIDITY = 100.0     # mist to this first; a DHT22 often tops out at 99.x
 MIST_SETTLE_SECONDS = 120   # after the mist stops, before the fan starts
-PAUSE_SECONDS = 60          # after each run, before the next Start
+HOLD_SECONDS = 60           # fan off after Reached, before the next Start (not checked)
 
 # --- Which devices ---
 SENSOR_ID = 1
@@ -536,14 +537,8 @@ def main():
             f"step {_fmt(PWM_STEP)}%), target {_humidity(TARGET_HUMIDITY_DROP)}")
 
         baseline = newest_reading_time(api)
-        first = True
 
         while not progress.complete:
-            if not first:
-                log(f"pause {PAUSE_SECONDS:g}s - mist and fan off")
-                time.sleep(PAUSE_SECONDS)
-            first = False
-
             repeat, pwm = progress.repeat, progress.current
             log(f"=== repeat {repeat} of {REPEATS}, round {_fmt(pwm)}% ===")
             log(f"recorded: {progress.begin_round()}")
@@ -565,8 +560,13 @@ def main():
             progress.finish_round(line)
             log(f"recorded: {line}")
 
+            # Fan off as soon as the target is reached, then the hold. The
+            # hold follows every run, the last one too, so the box always gets
+            # it before whatever runs next.
             stop_fan(api, fan_id)
             baseline = newest_reading_time(api)
+            log(f"hold {HOLD_SECONDS:g}s - mist and fan off")
+            time.sleep(HOLD_SECONDS)
 
         log("experiment complete")
         return 0

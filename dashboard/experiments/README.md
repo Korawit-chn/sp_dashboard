@@ -137,7 +137,7 @@ same way and differ only in what ends a run:
 
 | Script | A run ends when | Writes |
 |---|---|---|
-| `vpd_time_experiment.py` | VPD (sensorID 1) is at or above **0.35 kPa** and stays there for **60 s** | `vpd_time_experiment.txt` |
+| `vpd_time_experiment.py` | the **first** VPD reading (sensorID 1) at or above **0.35 kPa** | `vpd_time_experiment.txt` |
 | `humidity_time_experiment.py` | the **first** humidity reading (sensorID 1) at or below **80%** | `humidity_time_experiment.txt` |
 
 Each script runs on its own - nothing is shared between them. Setup is the
@@ -146,13 +146,15 @@ same as for the Fan PWM experiment above.
 Each script steps the fan through 10%, 25% ... 100% and does that whole set 3
 times. One round:
 
-1. Pause 60 s with the mist and fan off (skipped before the first round of a
-   start), then record **Start**.
+1. Record **Start**.
 2. Mist until humidity reaches 100%, then mist off. Skipped when the box is
    already at 100%.
 3. Wait 2 min, start the fan at the round's PWM, and record **Fan on**.
-4. Wait, with no timeout, until the target is reached, and record
-   **Reached**. Then fan off.
+4. Wait, with no timeout, for the first reading at the target, and record
+   **Reached**.
+5. Fan off straight away, then hold 60 s with the mist and fan off. The
+   sensor is not checked during the hold. The hold follows every run, the
+   last one too, and then the next round starts.
 
 ```
 python dashboard\experiments\vpd_time_experiment.py
@@ -174,12 +176,12 @@ Repeat 1
 2026-11-09 12:11:12 Start 25%
 ```
 
-- **Start** is this PC's time when the round begins, after the pause.
+- **Start** is this PC's time when the round begins, after the previous
+  round's hold.
 - **Fan on** is when the fan Pi reported it was running. `(unconfirmed)` means
   it did not report within 30 s and the send time was used.
-- **Reached** is the sensor reading's own timestamp. For VPD it is the first
-  reading of the 60 s hold that succeeded; a reading that drops back below
-  0.35 kPa restarts the hold. The bracket is the time from Fan on to Reached,
+- **Reached** is the timestamp of the first reading at the target. The
+  bracket is the time from Fan on to Reached,
   and it is only right if the sensor Pi's clock agrees with this PC's.
 - Readings only arrive as often as the sensor uploads (60 s by default), so
   Reached can be up to one upload late. A shorter send period in the
@@ -196,10 +198,10 @@ Repeat 1
 
 ## Settings
 
-Edit the constants at the top of each script: the target (`TARGET_VPD` with
-`HOLD_SECONDS`, or `TARGET_HUMIDITY_DROP`), `PWM_START` / `PWM_STEP`,
-`REPEATS`, `TARGET_HUMIDITY` (what the box is misted to), `MIST_SETTLE_SECONDS`
-(120) and `PAUSE_SECONDS` (60). The devices (`SENSOR_ID`, `LOCATION`,
+Edit the constants at the top of each script: the target (`TARGET_VPD` or
+`TARGET_HUMIDITY_DROP`), `PWM_START` / `PWM_STEP`, `REPEATS`,
+`TARGET_HUMIDITY` (what the box is misted to), `MIST_SETTLE_SECONDS` (120) and
+`HOLD_SECONDS` (60, fan off after each run). The devices (`SENSOR_ID`, `LOCATION`,
 `FAN_TYPE`, `MIST_TYPE`) have the same names as in `fan_pwm_experiment.py`.
 
 The three experiment scripts each carry their own copy of the misting, fan and
